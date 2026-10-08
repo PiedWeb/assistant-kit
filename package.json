@@ -1,0 +1,39 @@
+{
+  "name": "@piedweb/assistant-kit",
+  "version": "0.1.0",
+  "description": "Connecteurs partagés des assistants Pied Web : API Pushword (snapshot, synchro, statique, médias), trousseau et vault, Cadrank, IMAP/SMTP.",
+  "license": "MIT",
+  "author": "Robin@PiedWeb <contact@piedweb.com> (https://piedweb.com)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PiedWeb/assistant-kit.git"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": "./src/index.js",
+    "./http": "./src/http.js",
+    "./pushword": "./src/pushword/index.js",
+    "./secrets": "./src/secrets/index.js",
+    "./cadrank": "./src/cadrank.js",
+    "./mail": "./src/mail.js",
+    "./cli": "./src/cli.js",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "check": "node --test && node scripts/check-require.cjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "imapflow": "^2.3.0",
+    "nodemailer": "^10.0.16",
+    "tar": "^7.5.22"
+  }
+}
