@@ -28,14 +28,21 @@ tronc commun `../GrandAngle/AI-SolarSystem-Core`. Dépôt public
 3. `git tag vX.Y.Z && git push origin main vX.Y.Z`.
 4. Dans chaque consommateur, changer le tag de la dépendance puis `npm install`.
 
-## Reprise des autres projets
+## Consommateurs
 
-- `altimood/Assistant` : remplacer `src/http.js`, `src/pushword.js`,
-  `src/keychain.js`, `src/vault*.js`, `src/cadrank.js`, `src/mail.js` par la
-  librairie. Garder l'espace de noms `secrets-altimood-assistant.invalid` et
-  `ALTIMOOD_SECRET_HELPER` pour retrouver les secrets déjà enregistrés.
-- Tronc commun Grand Angle : son trousseau stocke un manifeste et des valeurs
-  en base64url, incompatible avec ce format ; prévoir une migration. Ses
-  points forts à remonter ici : Cadrank complet (cache des crawls, relance
-  auditée), IMAP avec brouillons et réponses, API `/api/editor/*` d'identité
-  Microsoft, lecteur tar sans dépendance.
+- `piedweb.com/Assistant` et `altimood/Assistant` : `bin/assistant.js` appelle
+  `runAssistant()` ; `src/config.js` porte le catalogue, les hôtes et les règles
+  du projet. Altimood ajoute `docs` et `pushword context-pull`.
+- Tronc commun Grand Angle (`../GrandAngle/AI-SolarSystem-Core`, CommonJS) :
+  pas encore branché. Le format du trousseau, le JSON `SMTP_IMAP_ACCOUNTS` et
+  les points d'extension du README sont faits pour qu'il remplace ses
+  connecteurs par la librairie sans rien perdre : `conf()` sur
+  `createKeychain` (espace `secrets-solarsystem.{grandangle|furthertreks}.invalid`,
+  `GA_SECRET_HELPER`, `GA_SECRET_DISABLE`), `requestWithRetry` sur
+  `HttpClient.exchange`, `SmtpImapClient` sur `MailClient` (`authorize`,
+  `audit`, `mark`), Pushword de Jupiter sur `ContentWorkspace` (`onPulled` pour
+  `data.tar.gz`). Restent chez lui : l'identité Microsoft, l'EditorClient, le
+  catalogue, l'interface du Coffre-fort, la composition et le style des mails.
+  Prérequis : Node 22.12 sur les postes et la VM Windows.
+- Une correction se fait ici, puis chaque projet monte de version : jamais de
+  copie locale modifiée.
