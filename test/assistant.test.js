@@ -68,12 +68,13 @@ test('a file named on the command line syncs whatever its host, sync-all keeps t
   const calls = [];
   const workspace = {
     client: {},
-    modifiedSincePull: () => ['/tmp/content/example.com/page.md'],
-    sync: async (files, options) => { calls.push(options.anyHost); return { results: [], ok: true }; },
+    sync: async (files, options) => { calls.push(['sync', options.anyHost]); return { results: [], ok: true }; },
+    syncAll: async () => { calls.push(['syncAll']); return { results: [], ok: true, skipped: [] }; },
   };
   await run(['pushword', 'sync', 'content/other.example/page.md'], { createWorkspace: () => workspace });
-  await run(['pushword', 'sync-all'], { createWorkspace: () => workspace });
-  assert.deepEqual(calls, [true, false]);
+  const all = await run(['pushword', 'sync-all'], { createWorkspace: () => workspace });
+  assert.deepEqual(calls, [['sync', true], ['syncAll']]);
+  assert.match(all.stdout, /Aucune page modifiée/);
 });
 
 test('projects add actions and scopes, and replace a built-in action', async () => {

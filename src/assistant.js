@@ -226,19 +226,18 @@ async function pushwordCommand(context) {
     return undefined;
   }
   if (action === 'sync' || action === 'sync-all') {
-    if (action === 'sync') usage(1, 'pushword sync <fichier ...>');
-    const files = action === 'sync' ? args.map((file) => path.resolve(file)) : workspace.modifiedSincePull();
-    if (!files.length) {
-      stdout.write('Aucune page modifiée depuis le dernier pull.\n');
-      return undefined;
+    let outcome;
+    if (action === 'sync') {
+      usage(1, 'pushword sync <fichier ...>');
+      // A file named on the command line is pushed on purpose, whatever its host.
+      outcome = await workspace.sync(args.map((file) => path.resolve(file)), { publish, anyHost: true });
+    } else {
+      // Pages of hosts outside the project stay local and are reported by the workspace.
+      outcome = await workspace.syncAll({ publish });
+      if (!outcome.results.length && !outcome.skipped?.length) stdout.write('Aucune page modifiée depuis le dernier pull.\n');
     }
-    // A file named on the command line is pushed on purpose, whatever its host.
-    const { results, ok } = await workspace.sync(files, { publish, anyHost: action === 'sync' });
-    printPublication(results.map((result) => result.static), stdout);
-    for (const result of results.filter((entry) => entry.status !== 'synced')) {
-      settings.stderr.write(`✗ ${result.file ? path.relative(process.cwd(), result.file) : ''} : ${result.message || result.status}\n`);
-    }
-    if (!ok) process.exitCode = 2;
+    printPublication(outcome.results.map((result) => result.static), stdout);
+    if (!outcome.ok) process.exitCode = 2;
     return undefined;
   }
   if (action === 'create') {
