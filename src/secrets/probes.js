@@ -81,14 +81,28 @@ export function jsonProbe({ url, headers, check, detail }) {
   };
 }
 
-/** Pushword identity behind a bearer token. */
-export function pushwordProbe({ baseUrl, tokenField = 'PUSHWORD_TOKEN' }) {
-  return jsonProbe({
-    url: (values) => `${(typeof baseUrl === 'function' ? baseUrl(values) : baseUrl).replace(/\/+$/, '')}/api/whoami`,
+/**
+ * Pushword identity behind a bearer token. With `snapshotKeyField`, also (or,
+ * with `tokenField: null`, only) the snapshot key, by a HEAD that downloads
+ * nothing.
+ */
+export function pushwordProbe({ baseUrl, tokenField = 'PUSHWORD_TOKEN', snapshotKeyField = null }) {
+  const base = (values) => (typeof baseUrl === 'function' ? baseUrl(values) : baseUrl).replace(/\/+$/, '');
+  const identity = tokenField && jsonProbe({
+    url: (values) => `${base(values)}/api/whoami`,
     headers: (values) => ({ Authorization: `Bearer ${values[tokenField]}` }),
     check: (data) => Boolean(data && typeof data === 'object' && data.id && (data.email || data.username)),
     detail: 'Pushword a reconnu le compte associé au jeton.',
   });
+  if (!snapshotKeyField) return identity;
+  return async (values, { fetchImpl, signal }) => {
+    const details = identity && values[tokenField] ? [await identity(values, { fetchImpl, signal })] : [];
+    safeUrl(`${base(values)}/api/content/snapshot.tar.gz`);
+    const { PushwordClient } = await import('../pushword/client.js');
+    const client = new PushwordClient({ baseUrl: base(values), snapshotKey: values[snapshotKeyField], fetchImpl });
+    await client.checkSnapshotKey(null, { signal, redirect: 'manual', attempts: 1 });
+    return [...details, 'Pushword a accepté la clé de snapshot.'].join(' ');
+  };
 }
 
 /** Cadrank project list behind an X-AUTH-TOKEN key. */

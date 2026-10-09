@@ -6,19 +6,49 @@ import { HttpClient, HttpError, parseResponse } from '../http.js';
 import { encodeSlug, validateHost } from './content.js';
 
 const MARKDOWN = 'text/markdown; charset=UTF-8';
+const SNAPSHOT_PATH = '/api/content/snapshot.tar.gz';
+
+/**
+ * Upload formats, by extension: the list pushword/core accepts
+ * (SafeMediaMimeType::EXTENSIONS). Refused here before the bytes travel.
+ */
+export const MEDIA_TYPES = Object.freeze({
+  avif: 'image/avif', cr2: 'image/x-canon-cr2', csv: 'text/csv', gif: 'image/gif',
+  gpx: 'application/gpx+xml', jpeg: 'image/jpeg', jpg: 'image/jpeg', mov: 'video/quicktime',
+  mp4: 'video/mp4', pdf: 'application/pdf', png: 'image/png', svg: 'image/svg+xml',
+  txt: 'text/plain', webm: 'video/webm', webp: 'image/webp', zip: 'application/zip',
+});
+
+export const DEFAULT_MAX_MEDIA_BYTES = 50 * 1024 * 1024;
 
 /**
  * Client for the pushword/api bundle (and the routes pushword/flat and
  * pushword/static-generator add to it). Addresses pages by (host, slug).
+ *
+ * Built to be extended: no private fields, every call goes through
+ * `this.http`. `token` and `snapshotKey` are strings or functions (sync or
+ * async) resolved at each request.
  */
 export class PushwordClient {
-  constructor({ baseUrl, token = null, snapshotKey = null, userAgent = 'assistant-kit/1.0', fetchImpl, http } = {}) {
+  constructor({
+    baseUrl,
+    token = null,
+    snapshotKey = null,
+    userAgent = 'assistant-kit/1.0',
+    fetchImpl,
+    http,
+    httpOptions = {},
+    mediaTypes = MEDIA_TYPES,
+    maxMediaBytes = DEFAULT_MAX_MEDIA_BYTES,
+  } = {}) {
     if (!baseUrl && !http) {
       throw new Error('Adresse de l’API Pushword manquante.');
     }
     this.baseUrl = String(baseUrl || http.baseUrl).replace(/\/+$/, '');
     this.snapshotKey = snapshotKey;
-    this.http = http || new HttpClient({ baseUrl: this.baseUrl, token, userAgent, fetchImpl });
+    this.mediaTypes = mediaTypes;
+    this.maxMediaBytes = maxMediaBytes;
+    this.http = http || new HttpClient({ baseUrl: this.baseUrl, token, userAgent, fetchImpl, ...httpOptions });
   }
 
   // Identity and discovery
@@ -89,13 +119,16 @@ export class PushwordClient {
     return { status: response.status, text: await response.text() };
   }
 
-  /** Stream the host's flat export (tar.gz) to `destination`. */
+  /**
+   * Stream the host's flat export (tar.gz) to `destination`. The snapshot key
+   * and the token never follow a redirect to another origin.
+   */
   async downloadSnapshot(host, destination) {
     validateHost(host);
-    const headers = this.snapshotKey ? { 'X-Pushword-Snapshot-Key': this.snapshotKey } : {};
-    const response = await this.http.send('GET', `/api/content/snapshot.tar.gz?host=${encodeURIComponent(host)}`, {
+    const key = await resolveSecret(this.snapshotKey);
+    const response = await this.http.send('GET', `${SNAPSHOT_PATH}?host=${encodeURIComponent(host)}`, {
       accept: 'application/gzip',
-      headers,
+      headers: key ? { 'X-Pushword-Snapshot-Key': key } : {},
       timeoutMs: 120_000,
     });
     if (!response.ok || !response.body) {
@@ -105,6 +138,32 @@ export class PushwordClient {
     fs.mkdirSync(path.dirname(destination), { recursive: true });
     await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(destination));
     return destination;
+  }
+
+  /**
+   * Check the snapshot key alone (no token) with a HEAD: the server refuses a
+   * wrong key before writing any byte of the archive. Throws an HttpError
+   * carrying the status unless the server answers 200.
+   */
+  async checkSnapshotKey(host = null, { signal, redirect, attempts } = {}) {
+    const key = await resolveSecret(this.snapshotKey);
+    if (!key) {
+      throw new Error('Clé de snapshot Pushword absente.');
+    }
+    const query = host ? `?host=${encodeURIComponent(validateHost(host))}` : '';
+    const response = await this.http.send('HEAD', `${SNAPSHOT_PATH}${query}`, {
+      accept: 'application/gzip',
+      headers: { 'X-Pushword-Snapshot-Key': key },
+      auth: false,
+      signal,
+      redirect,
+      attempts,
+    });
+    await response.body?.cancel().catch(() => undefined);
+    if (response.status !== 200) {
+      throw new HttpError(`Clé de snapshot Pushword refusée : HTTP ${response.status}`, response.status);
+    }
+    return { ok: true, status: response.status };
   }
 
   // Static generation
@@ -153,13 +212,30 @@ export class PushwordClient {
     return (await this.http.request('GET', mediaPath(filename))).payload;
   }
 
-  async uploadMedia(filePath, { filename = path.basename(filePath), alt = '' } = {}) {
+  /**
+   * Upload a file (a path, or `{ bytes, filename }` already in memory). The
+   * server names the media after `filename` and keeps the extension of the
+   * bytes. Optional metadata: `alt`, `alts` ({ locale: text }), `tags`,
+   * `customProperties`, `fileNameHistory`. A 200 with `duplicate: true` means
+   * the same bytes were already there. Never retried: a lost answer must not
+   * become a second media.
+   */
+  async uploadMedia(source, {
+    filename, alt = '', alts, tags, customProperties, fileNameHistory, maxBytes = this.maxMediaBytes,
+  } = {}) {
+    const file = readMediaSource(source, maxBytes);
+    const type = mediaType(file.name, this.mediaTypes);
     const form = new FormData();
-    form.append('file', new Blob([fs.readFileSync(filePath)]), filename);
+    form.append('file', new Blob([file.bytes], { type }), file.name);
     if (alt) {
       form.append('alt', alt);
     }
-    return (await this.http.request('POST', mediaPath(filename), {
+    for (const [name, value] of Object.entries({ alts, tags, customProperties, fileNameHistory })) {
+      if (value !== undefined && value !== null) {
+        form.append(name, JSON.stringify(value));
+      }
+    }
+    return (await this.http.request('POST', mediaPath(filename || file.name), {
       body: form,
       expectedStatus: [200, 201],
     })).payload;
@@ -209,6 +285,46 @@ function pagePath(prefix, host, slug) {
 
 function mediaPath(filename) {
   return `/api/media/${encodeSlug(filename)}`;
+}
+
+async function resolveSecret(value) {
+  const resolved = typeof value === 'function' ? await value() : value;
+  return resolved ? String(resolved) : null;
+}
+
+function readMediaSource(source, maxBytes) {
+  if (source && typeof source === 'object' && source.bytes) {
+    const name = path.basename(String(source.filename || ''));
+    if (!name) {
+      throw new Error('Nom de fichier manquant pour un média en mémoire.');
+    }
+    return { name, bytes: withinLimit(source.bytes, maxBytes, name) };
+  }
+  const filePath = String(source || '');
+  if (!filePath) {
+    throw new Error('Aucun fichier à téléverser.');
+  }
+  const name = path.basename(filePath);
+  withinLimit({ length: fs.statSync(filePath).size }, maxBytes, name);
+  return { name, bytes: fs.readFileSync(filePath) };
+}
+
+function withinLimit(bytes, maxBytes, name) {
+  if (bytes.length > maxBytes) {
+    const megabytes = (value) => Math.round((value / 1024 / 1024) * 10) / 10;
+    throw new Error(`Média trop lourd : ${name} pèse ${megabytes(bytes.length)} Mo pour ${megabytes(maxBytes)} Mo au maximum.`);
+  }
+  return bytes;
+}
+
+function mediaType(name, types) {
+  const extension = path.extname(name).slice(1).toLowerCase();
+  const type = Object.hasOwn(types, extension) ? types[extension] : null;
+  if (!type) {
+    throw new Error(`Format de média refusé (${extension ? `.${extension}` : 'sans extension'}) : `
+      + `formats acceptés : ${Object.keys(types).join(', ')}.`);
+  }
+  return type;
 }
 
 function queryString(query) {

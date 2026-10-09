@@ -45,14 +45,18 @@ export function pagesFromHookPayload(workspace, rawPayload) {
 /**
  * Run the PostToolUse sync. Returns the exit code for the hook: 2 makes Claude
  * Code feed stderr back to the model, which must see every failure (a 409
- * replaced the file and discarded the edit, an auth error needs a new token).
+ * replaced the file and discarded the edit, an auth error needs a new token,
+ * a page of a host outside the workspace hosts stayed local).
+ *
+ * An edit is never a reason to publish another host: the hook pushes the
+ * workspace hosts only.
  */
-export async function runSyncHook(workspace, rawPayload) {
+export async function runSyncHook(workspace, rawPayload, { publish = true } = {}) {
   const pages = pagesFromHookPayload(workspace, rawPayload);
   if (!pages.length) {
     return 0;
   }
-  const { results } = await workspace.sync(pages.map((page) => page.absolutePath));
+  const { results } = await workspace.sync(pages.map((page) => page.absolutePath), { publish, anyHost: false });
   const staticFailed = results.some((result) => result.static && !result.static.generated && result.static.error);
   return results.every((result) => result.status === 'synced') && !staticFailed ? 0 : 2;
 }
