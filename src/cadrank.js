@@ -138,10 +138,14 @@ export class CadrankClient {
     return this.getCsv(`urlSearchData/${encodeURIComponent(trackedHost)}${filter ? `/${filter}` : ''}`);
   }
 
-  /** Export of the latest crawl. Default filter: URLs with a main keyword (`all: true` drops it). */
+  /**
+   * Export of the latest crawl. Default filter: URLs with a main keyword (`all: true` drops it).
+   * A forced recrawl clones the crawl under a new id; `last=1` follows that chain from any
+   * older id. Cadrank reads the flag as a boolean: a bare `?last` counts as false.
+   */
   async crawlExport(crawlId, { all = false, filter } = {}) {
     const expression = filter ?? (all ? '' : NETLINK_FILTER);
-    return this.getCsv(`crawler/${encodeURIComponent(crawlId)}/exportCsv${expression ? `/${expression}` : ''}?last`);
+    return this.getCsv(`crawler/${encodeURIComponent(crawlId)}/exportCsv${expression ? `/${expression}` : ''}?last=1`);
   }
 
   async keywordsForUrl(url) {

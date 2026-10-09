@@ -106,12 +106,16 @@ test('Cadrank errors name the instance and the cause; filters reach the path', a
     'GET /_api/projects': () => Response.json([{ id: 1, crawls: [{ host: 'www.example.com', hashId: 'Abc' }] }]),
     'GET /_api/urlSearchData/www.example.com/(where:x)': () => new Response('url\n/a\n'),
     [`GET /_api/crawler/Abc/exportCsv/${decodeURIComponent(NETLINK_FILTER)}`]: () => new Response('url\n'),
+    'GET /_api/crawler/Abc/exportCsv': () => new Response('url\n'),
     'GET /_api/searchForUrl/https://denied.test/': () => new Response('Invalid key', { status: 403 }),
   }, { instance: 'us', baseUrl: 'https://cadrank.example.test' });
 
   assert.deepEqual(await client.mapping('example.com', { filter: '(where:x)' }), [{ url: '/a' }]);
   await client.crawlExport('Abc');
-  assert.ok(calls.at(-1).url.endsWith(`/exportCsv/${NETLINK_FILTER}?last`));
+  assert.ok(calls.at(-1).url.endsWith(`/exportCsv/${NETLINK_FILTER}?last=1`));
+  // Unfiltered: no empty segment (Cadrank only matches it through a redirect).
+  await client.crawlExport('Abc', { all: true });
+  assert.ok(calls.at(-1).url.endsWith('/crawler/Abc/exportCsv?last=1'));
   await assert.rejects(client.keywordsForUrl('https://denied.test/'), (error) => {
     assert.equal(error.status, 403);
     assert.match(error.message, /^Cadrank us : HTTP 403 sur searchForUrl\/.* \(Invalid key\)\. Clé absente ou invalide pour l’instance us/);
