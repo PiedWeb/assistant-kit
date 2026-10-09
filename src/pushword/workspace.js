@@ -438,9 +438,8 @@ export class ContentWorkspace {
 }
 
 function allowedEntry(entryPath, entry) {
-  if (entry.type === 'Directory') {
-    return true;
-  }
+  // Directories come with the files they hold: one left empty on the server (its
+  // pages moved) or holding only files that stay there is not mirrored.
   if (!['File', 'OldFile', 'ContiguousFile'].includes(entry.type)) {
     return false;
   }

@@ -93,6 +93,37 @@ test('pull installs editorial files only, marks the pull and refuses to wipe uns
   await assert.rejects(workspace.pull(), (error) => /non synchronisées/.test(error.message) && error.code === 'UNSYNCED_CHANGES');
 });
 
+test('pull keeps the page indexes of every locale, and no directory without a mirrored file', async (t) => {
+  // As the server builds it: `tar -C {host} .`, directory entries included.
+  const source = temporaryDirectory(t, 'assistant-kit-archive-');
+  const files = {
+    'page.md': page('r1'),
+    'index.draft.csv': 'slug\n',
+    'index.en.csv': 'slug\n',
+    'index.draft.en.csv': 'slug\n',
+    'index.draft.de-DE.csv': 'slug\n',
+    'quiz-result.csv': 'uuid,score\n',
+    'social-post/blog/post/linkedin.json': '{}\n',
+  };
+  for (const [name, text] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(source, name)), { recursive: true });
+    fs.writeFileSync(path.join(source, name), text);
+  }
+  fs.mkdirSync(path.join(source, 'moved', 'away'), { recursive: true });
+  const file = path.join(source, '..', `${path.basename(source)}.tar.gz`);
+  await tar.c({ gzip: true, file, cwd: source }, ['.']);
+  t.after(() => fs.rmSync(file, { force: true }));
+  const archive = fs.readFileSync(file);
+  const { root, workspace } = workspaceFor(t, {
+    'GET /api/content/snapshot.tar.gz': () => new Response(archive, { status: 200 }),
+  });
+
+  await workspace.pull();
+
+  assert.deepEqual(fs.readdirSync(path.join(root, 'content', HOST)).sort(),
+    ['index.draft.csv', 'index.draft.de-DE.csv', 'index.draft.en.csv', 'index.en.csv', 'page.md']);
+});
+
 test('an empty snapshot keeps the previous mirror', async (t) => {
   const good = await snapshotArchive(t, { 'page.md': page('r1') });
   const empty = await snapshotArchive(t, { 'conversation.csv': 'x\n' });

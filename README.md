@@ -74,8 +74,9 @@ un nouveau pull refuse d'écraser une modification qui n'a pas atteint le
 serveur, et `git -C content diff last-pull` montre tout ce qui a changé depuis
 le pull. Le hook et `syncAll()` ne poussent que les hôtes du projet ; un
 fichier nommé exprès (`anyHost: true`) part quel que soit son hôte. Le
-snapshot n'installe que les `.md`, `redirection.csv` et les `index*.csv`, jamais
-`AGENTS.md` ni `CLAUDE.md`. Il part avec la clé de snapshot seule quand le
+snapshot n'installe que les `.md`, `redirection.csv` et les index de Pushword
+(`index.csv`, `index.draft.csv`, aussi par langue), jamais `AGENTS.md` ni
+`CLAUDE.md` ni un dossier qui n'en contient aucun. Il part avec la clé de snapshot seule quand le
 projet en a une (`snapshotKey`), sinon avec le jeton ; `snapshotTimeoutMs` borne
 son téléchargement (2 minutes). `onPulled({ host, directory })` ajoute une étape
 propre au projet après chaque pull.

@@ -7,13 +7,15 @@ const HOST = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/;
 // Agent instruction files are not pages: a stale copy left in a server's
 // content directory must never land in the mirror, where agents would obey it.
 const AGENT_FILES = new Set(['AGENTS.md', 'CLAUDE.md']);
+// Pushword's page indexes, named as its flat importer reads them: `index.csv` and
+// `index.draft.csv`, each also per locale (`index.en.csv`, `index.draft.de-DE.csv`).
+const INDEX_FILE = /^index(?:\.draft)?(?:\.[a-z]{2}(?:[-_][a-zA-Z]{2,})?)?\.csv$/;
 
 /** Files a snapshot may install. Anything else (conversations, quiz results) stays on the server. */
 export function isSnapshotFile(relativePath) {
   const name = path.posix.basename(relativePath);
   if (AGENT_FILES.has(name)) return false;
-  return relativePath.endsWith('.md') || ['redirection.csv', 'index.csv', 'index.draft.csv'].includes(name)
-    || /^index\.[a-z]{2}(?:[-_][a-zA-Z]{2,4})?\.csv$/.test(name);
+  return relativePath.endsWith('.md') || name === 'redirection.csv' || INDEX_FILE.test(name);
 }
 
 export function validateHost(host) {
