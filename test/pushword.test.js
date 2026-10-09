@@ -68,6 +68,7 @@ test('pull installs editorial files only, marks the pull and refuses to wipe uns
     'redirection.csv': 'from,to\n',
     'index.en.csv': 'slug\n',
     'conversation.csv': 'private customer data\n',
+    'AGENTS.md': '# stale agent guide\n',
   });
   const { root, workspace, server } = workspaceFor(t, {
     'GET /api/content/snapshot.tar.gz': () => new Response(archive, { status: 200 }),
@@ -81,6 +82,7 @@ test('pull installs editorial files only, marks the pull and refuses to wipe uns
   assert.ok(fs.existsSync(path.join(content, 'redirection.csv')));
   assert.ok(fs.existsSync(path.join(content, 'index.en.csv')));
   assert.equal(fs.existsSync(path.join(content, 'conversation.csv')), false);
+  assert.equal(fs.existsSync(path.join(content, 'AGENTS.md')), false);
   assert.ok(fs.existsSync(path.join(root, '.claude', '.last-pull')));
   assert.equal(server.requests[0].path, `/api/content/snapshot.tar.gz?host=${HOST}`);
   assert.equal(server.requests[0].headers.get('Authorization'), 'Bearer api-token');

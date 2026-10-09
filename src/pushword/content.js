@@ -4,9 +4,14 @@ import path from 'node:path';
 const PAGE_FILE = /^([^/]+)\/(.+)\.md$/;
 const HOST = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/;
 
+// Agent instruction files are not pages: a stale copy left in a server's
+// content directory must never land in the mirror, where agents would obey it.
+const AGENT_FILES = new Set(['AGENTS.md', 'CLAUDE.md']);
+
 /** Files a snapshot may install. Anything else (conversations, quiz results) stays on the server. */
 export function isSnapshotFile(relativePath) {
   const name = path.posix.basename(relativePath);
+  if (AGENT_FILES.has(name)) return false;
   return relativePath.endsWith('.md') || ['redirection.csv', 'index.csv', 'index.draft.csv'].includes(name)
     || /^index\.[a-z]{2}(?:[-_][a-zA-Z]{2,4})?\.csv$/.test(name);
 }

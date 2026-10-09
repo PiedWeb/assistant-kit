@@ -1,6 +1,6 @@
 {
   "name": "@piedweb/assistant-kit",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Connecteurs partagés des assistants Pied Web : API Pushword (snapshot, synchro, statique, médias), trousseau et vault, Cadrank, IMAP/SMTP.",
   "license": "MIT",
   "author": "Robin@PiedWeb <contact@piedweb.com> (https://piedweb.com)",

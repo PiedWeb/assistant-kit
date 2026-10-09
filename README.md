@@ -20,7 +20,7 @@ noms de credentials, textes, CLI) et importe ici le comportement.
 
 ```json
 "dependencies": {
-  "@piedweb/assistant-kit": "github:PiedWeb/assistant-kit#v0.1.0"
+  "@piedweb/assistant-kit": "github:PiedWeb/assistant-kit#v0.1.1"
 }
 ```
 
