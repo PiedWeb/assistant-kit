@@ -114,6 +114,23 @@ test('a silent helper is unavailable, never empty; a GCM refusal is absent', () 
   assert.equal(createKeychain({ namespace: NAMESPACE, run: timeout, environment: {}, sleep: noSleep }).status().unavailable, true);
 });
 
+test('saving a form does not ask the helper again for the values it already read', () => {
+  const git = fakeGit();
+  const keychain = createKeychain({ namespace: NAMESPACE, run: git.run, environment: {}, sleep: noSleep });
+  keychain.save({ A: 'a', B: 'b', C: 'c' });
+  keychain.refresh();
+  assert.deepEqual(keychain.values(), { A: 'a', B: 'b', C: 'c' });
+  const gets = () => git.calls.filter((args) => args[0] === 'credential-libsecret').length;
+  const before = gets();
+
+  keychain.save({ A: 'a', B: 'changed', C: 'c' }, { replace: true });
+
+  // The index, then B read back after its write: never A nor C.
+  assert.equal(gets() - before, 2);
+  keychain.refresh();
+  assert.deepEqual(keychain.values(), { A: 'a', B: 'changed', C: 'c' });
+});
+
 test('save merges by default and replaces on request; forgetAll leaves foreign entries alone', () => {
   const git = fakeGit();
   git.store.set(`${NAMESPACE}/git-forge-token`, 'foreign');
@@ -159,6 +176,13 @@ test('git and helpers never prompt, and libsecret finds the desktop bus', () => 
 test('helper names never reach the shell with arguments', () => {
   assert.equal(secureHelperName('libsecret'), 'libsecret');
   assert.equal(secureHelperName('/usr/libexec/git-core/git-credential-libsecret'), '/usr/libexec/git-core/git-credential-libsecret');
+  // Git for Windows: raw, quoted or already escaped as Git config holds it, one helper string.
+  const manager = 'C:/Program\\ Files/Git/mingw64/bin/git-credential-manager.exe';
+  for (const form of [
+    'C:\\Program Files\\Git\\mingw64\\bin\\git-credential-manager.exe',
+    '"C:/Program Files/Git/mingw64/bin/git-credential-manager.exe"',
+    manager,
+  ]) assert.equal(secureHelperName(form), manager, form);
   assert.equal(secureHelperName('store'), null);
   assert.equal(secureHelperName('libsecret; rm -rf /'), null);
   assert.equal(secureHelperName('!echo secret'), null);

@@ -48,11 +48,14 @@ export function validateCredentialValue(value, { multiline = false } = {}) {
 
 // Git executes helper strings through a shell. Accept only a known bare name or
 // a simple absolute path, never shell commands, arguments or metacharacters.
+// The path may come quoted, raw, or already shell-escaped as Git config holds
+// it (`C:/Program\ Files/...`).
 export function secureHelperName(value) {
   const candidate = String(value || '').trim();
   const bare = candidate.replace(/^git-credential-/, '').replace(/\.exe$/i, '');
   if (SECURE_HELPERS.has(bare)) return candidate;
-  const unquoted = candidate.startsWith('"') && candidate.endsWith('"') ? candidate.slice(1, -1) : candidate;
+  const quoted = candidate.startsWith('"') && candidate.endsWith('"');
+  const unquoted = (quoted ? candidate.slice(1, -1) : candidate).replaceAll('\\ ', ' ');
   if (!/^(?:\/|[A-Za-z]:[\\/])[A-Za-z0-9_ .:/\\-]+$/.test(unquoted)) return null;
   const basename = unquoted.replaceAll('\\', '/').split('/').pop().replace(/\.exe$/i, '').replace(/^git-credential-/, '');
   if (!SECURE_HELPERS.has(basename)) return null;
@@ -337,7 +340,13 @@ export function createKeychain({
     if (!cleaned.length) throw new VaultError('Renseignez au moins une valeur avant d’enregistrer.');
     const index = names({ fresh: true });
     const previousKeys = index || [];
-    const changed = cleaned.filter(([name, value]) => (index && !index.includes(name) ? '' : stored(name)) !== value);
+    // A value read earlier in this process is not asked again: on Windows each
+    // helper call costs about a second, and a form saves every field at once.
+    const current = (name) => {
+      if (index && !index.includes(name)) return '';
+      return valueCache.has(name) ? valueCache.get(name).value : stored(name);
+    };
+    const changed = cleaned.filter(([name, value]) => current(name) !== value);
     for (const [name, value] of changed) {
       if (gitCredential('approve', VALUE_USER_PREFIX + name, encodeValue(value)).status !== 0) {
         throw new VaultError(`Le trousseau a refusé l’enregistrement de ${name}. ${installHelp(platform)}`);
