@@ -32,8 +32,9 @@
     "test": "node --test"
   },
   "dependencies": {
-    "imapflow": "^2.3.0",
-    "nodemailer": "^10.0.16",
+    "imapflow": "^2.0.5",
+    "mailparser": "^3.9.28",
+    "nodemailer": "^10.0.10",
     "tar": "^7.5.22"
   }
 }
