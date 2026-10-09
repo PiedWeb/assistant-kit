@@ -189,7 +189,12 @@ test('exchange returns status, headers, text and json without throwing on HTTP s
   assert.equal(proxy.text, '<html>proxy</html>');
 
   const down = client([new TypeError('reset'), new TypeError('reset')], [], { attempts: 2 });
-  await assert.rejects(down.exchange('GET', '/a'), /échec réseau après 2 tentative/);
+  await assert.rejects(down.exchange('GET', '/a'), (error) => {
+    assert.match(error.message, /échec réseau après 2 tentative/);
+    assert.equal(error.code, 'NETWORK_ERROR');
+    assert.equal(error.cause.message, 'reset');
+    return true;
+  });
 });
 
 test('absolute URLs: same origin only with a baseUrl, any without one', async () => {

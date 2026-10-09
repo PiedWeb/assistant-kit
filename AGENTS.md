@@ -33,16 +33,14 @@ tronc commun `../GrandAngle/AI-SolarSystem-Core`. Dépôt public
 - `piedweb.com/Assistant` et `altimood/Assistant` : `bin/assistant.js` appelle
   `runAssistant()` ; `src/config.js` porte le catalogue, les hôtes et les règles
   du projet. Altimood ajoute `docs` et `pushword context-pull`.
-- Tronc commun Grand Angle (`../GrandAngle/AI-SolarSystem-Core`, CommonJS) :
-  pas encore branché. Le format du trousseau, le JSON `SMTP_IMAP_ACCOUNTS` et
-  les points d'extension du README sont faits pour qu'il remplace ses
-  connecteurs par la librairie sans rien perdre : `conf()` sur
-  `createKeychain` (espace `secrets-solarsystem.{grandangle|furthertreks}.invalid`,
-  `GA_SECRET_HELPER`, `GA_SECRET_DISABLE`), `requestWithRetry` sur
-  `HttpClient.exchange`, `SmtpImapClient` sur `MailClient` (`authorize`,
-  `audit`, `mark`), Pushword de Jupiter sur `ContentWorkspace` (`onPulled` pour
-  `data.tar.gz`). Restent chez lui : l'identité Microsoft, l'EditorClient, le
-  catalogue, l'interface du Coffre-fort, la composition et le style des mails.
-  Prérequis : Node 22.12 sur les postes et la VM Windows.
+- Tronc commun Grand Angle (`../GrandAngle/AI-SolarSystem-Core`, CommonJS, par
+  `require(esm)`, Node 22.12 ou plus) : Pushword de Jupiter et FT-Saturne sur
+  `ContentWorkspace` (messages historiques par `report`, `onPulled` pour
+  `data.tar.gz`), `CadrankClient`, `MailClient` (`authorize`, `audit`, `mark`).
+  Restent chez lui : le trousseau et le transport HTTP de ses autres connecteurs,
+  l'identité Microsoft, l'EditorClient, le catalogue, l'interface du
+  Coffre-fort, la composition et le style des mails. Le format du trousseau
+  (`secrets-solarsystem.{grandangle|furthertreks}.invalid`) reste celui de
+  `createKeychain`.
 - Une correction se fait ici, puis chaque projet monte de version : jamais de
   copie locale modifiée.

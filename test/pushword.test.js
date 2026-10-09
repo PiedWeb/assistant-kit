@@ -90,7 +90,7 @@ test('pull installs editorial files only, marks the pull and refuses to wipe uns
   assert.equal(server.requests[0].headers.get('Authorization'), 'Bearer api-token');
 
   fs.appendFileSync(path.join(content, 'page.md'), 'local edit\n');
-  await assert.rejects(workspace.pull(), /non synchronisées/);
+  await assert.rejects(workspace.pull(), (error) => /non synchronisées/.test(error.message) && error.code === 'UNSYNCED_CHANGES');
 });
 
 test('an empty snapshot keeps the previous mirror', async (t) => {
@@ -102,7 +102,8 @@ test('an empty snapshot keeps the previous mirror', async (t) => {
   });
 
   await workspace.pull();
-  await assert.rejects(workspace.pull(), /vide/);
+  await assert.rejects(workspace.pull(), (error) => /vide/.test(error.message)
+    && error.code === 'EMPTY_SNAPSHOT' && error.host === HOST);
 
   assert.equal(fs.readFileSync(path.join(root, 'content', HOST, 'page.md'), 'utf8'), page('r1'));
 });
@@ -157,7 +158,23 @@ test('a file without revision is never sent, and an auth failure stops the batch
   const { results } = await workspace.sync(['new.md', 'a.md', 'b.md'].map((name) => path.join(directory, name)));
 
   assert.deepEqual(results.map((result) => result.status), ['no-revision', 'auth']);
+  assert.equal(results[1].httpStatus, 401);
   assert.equal(server.requests.length, 1);
+});
+
+test('an unexpected answer keeps its status and text for the caller’s own message', async (t) => {
+  const { root, workspace } = workspaceFor(t, {
+    'PUT /api/content/page/example.com/page': () => Response.json({ error: 'invalid front matter' }, { status: 422 }),
+  });
+  const file = path.join(root, 'content', HOST, 'page.md');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, page('r1'));
+
+  const [result] = (await workspace.sync([file])).results;
+
+  assert.equal(result.status, 'error');
+  assert.equal(result.httpStatus, 422);
+  assert.equal(result.responseText, '{"error":"invalid front matter"}');
 });
 
 test('create posts the raw file, keeps the canonical text and queues a host generation', async (t) => {
@@ -484,8 +501,34 @@ test('snapshot key and token never follow a redirect to another origin', async (
   assert.deepEqual(requests.map((request) => new URL(request.url).origin), ['https://edit.example.test']);
   assert.equal(requests[0].redirect, 'manual');
   assert.equal(requests[0].headers.get('X-Pushword-Snapshot-Key'), 'snapshot-key');
-  assert.equal(requests[0].headers.get('Authorization'), 'Bearer api-token');
+  assert.equal(requests[0].headers.has('Authorization'), false);
   assert.equal(fs.existsSync(destination), false);
+});
+
+test('a snapshot key travels alone: the token is neither sent nor resolved', async (t) => {
+  const archive = await snapshotArchive(t, { 'page.md': page('r1') });
+  const requests = [];
+  const fetchImpl = async (url, init) => {
+    requests.push({ url, headers: new Headers(init.headers), signal: init.signal });
+    return new Response(archive, { status: 200 });
+  };
+  let tokenAsked = 0;
+  const withKey = new PushwordClient({
+    baseUrl: 'https://edit.example.test', snapshotKey: () => 'snapshot-key', fetchImpl, snapshotTimeoutMs: 600_000,
+    token: () => { tokenAsked += 1; throw new Error('no editor token on this workstation'); },
+  });
+  const directory = temporaryDirectory(t);
+
+  await withKey.downloadSnapshot(HOST, path.join(directory, 'a.tar.gz'));
+  await new PushwordClient({ baseUrl: 'https://edit.example.test', token: 'api-token', fetchImpl })
+    .downloadSnapshot(HOST, path.join(directory, 'b.tar.gz'));
+
+  assert.equal(tokenAsked, 0);
+  assert.equal(withKey.snapshotTimeoutMs, 600_000);
+  assert.equal(requests[0].headers.get('X-Pushword-Snapshot-Key'), 'snapshot-key');
+  assert.equal(requests[0].headers.has('Authorization'), false);
+  assert.equal(requests[1].headers.get('Authorization'), 'Bearer api-token');
+  assert.equal(requests[1].headers.has('X-Pushword-Snapshot-Key'), false);
 });
 
 test('checkSnapshotKey sends a HEAD with the key alone; pushwordProbe uses it', async () => {

@@ -67,7 +67,8 @@ export class HttpClient {
 
   /**
    * Send a request and return the raw Response, after retries. The caller
-   * decides what an acceptable status is.
+   * decides what an acceptable status is. When no attempt got an answer, the
+   * error carries `code: 'NETWORK_ERROR'`.
    *
    * Options: body, headers, accept, idempotent, attempts, retryStatuses,
    * timeoutMs, signal, redirect ('follow', 'manual', 'error'), auth (false
@@ -101,9 +102,9 @@ export class HttpClient {
         response = await this.fetchWithRedirects(url, init);
       } catch (error) {
         if (error instanceof HttpError || options.signal?.aborted || attempt >= attempts) {
-          throw error instanceof HttpError ? error : new Error(
+          throw error instanceof HttpError ? error : Object.assign(new Error(
             `${verb} ${urlPath} : échec réseau après ${attempt} tentative(s) (${error.message})`, { cause: error },
-          );
+          ), { code: 'NETWORK_ERROR' });
         }
         await this.sleep(this.backoff(attempt));
         continue;

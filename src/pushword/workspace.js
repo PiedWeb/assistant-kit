@@ -11,6 +11,8 @@ const GIT_ENV = Object.freeze({ GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'Neve
 const LOCK_ATTEMPTS = 5;
 const LOCK_PAUSE_MS = 250;
 const LAST_PULL_REF = 'refs/tags/last-pull';
+// What a result keeps of an unexpected answer, for the caller's own message.
+const RESPONSE_TEXT_LIMIT = 2000;
 // A directory an editor, an indexer or an antivirus holds open cannot be renamed on Windows.
 const IN_PLACE_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
 
@@ -62,6 +64,8 @@ export class ContentWorkspace {
 
   /**
    * Replace the mirror of `hosts` with fresh production snapshots, atomically.
+   * Refuses with `code: 'UNSYNCED_CHANGES'` while an edit has not reached the
+   * server, and with `code: 'EMPTY_SNAPSHOT'` for a host without any page.
    * `onPulled({ host, directory, hosts, workspace })` runs for each installed
    * host before the baseline commit, so what it writes under `content/` is part
    * of the pulled state; its failure is logged and never undoes the pull.
@@ -84,7 +88,8 @@ export class ContentWorkspace {
         await this.client.downloadSnapshot(host, archive);
         await tar.x({ file: archive, cwd: extracted, strict: true, filter: allowedEntry });
         if (!walkMarkdown(extracted).length) {
-          throw new Error(`Snapshot Pushword vide pour ${host} : le miroir local est conservé.`);
+          throw Object.assign(new Error(`Snapshot Pushword vide pour ${host} : le miroir local est conservé.`),
+            { code: 'EMPTY_SNAPSHOT', host });
         }
       }
       installSnapshot(this.contentRoot, staged, hosts, { rename: this.rename, log: this.log });
@@ -114,7 +119,8 @@ export class ContentWorkspace {
    * Send page files to production. Returns one result per file; never throws
    * for HTTP outcomes. Without `anyHost`, a file of a host outside `hosts`
    * stays local (status `outside-hosts`): only a file named on purpose, with
-   * `anyHost: true`, publishes another host.
+   * `anyHost: true`, publishes another host. A refused write carries
+   * `httpStatus`, and `responseText` when the status was unexpected.
    */
   async sync(files, { publish = true, anyHost = false } = {}) {
     const results = [];
@@ -207,10 +213,11 @@ export class ContentWorkspace {
           + `(rev ${short(extractRevision(response.text))}). Réappliquer la modification sur ce nouveau texte.` });
     }
     if (response.status === 401 || response.status === 403) {
-      return this.report({ ...base, status: 'auth',
+      return this.report({ ...base, status: 'auth', httpStatus: response.status,
         message: `Authentification refusée par Pushword (HTTP ${response.status}) : vérifier le jeton.` });
     }
     return this.report({ ...base, status: 'error', httpStatus: response.status,
+      responseText: truncate(response.text, RESPONSE_TEXT_LIMIT),
       message: `${label} : HTTP ${response.status} inattendu : ${truncate(response.text, 300)}` });
   }
 
@@ -335,8 +342,8 @@ export class ContentWorkspace {
     }
     const status = this.git(['status', '--porcelain']).trim();
     if (status) {
-      throw new Error('Le miroir contient des modifications non synchronisées. '
-        + 'Les synchroniser ou les annuler avant un nouveau pull :\n' + status);
+      throw Object.assign(new Error('Le miroir contient des modifications non synchronisées. '
+        + 'Les synchroniser ou les annuler avant un nouveau pull :\n' + status), { code: 'UNSYNCED_CHANGES' });
     }
   }
 

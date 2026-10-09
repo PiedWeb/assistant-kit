@@ -7,6 +7,8 @@ import { encodeSlug, validateHost } from './content.js';
 
 const MARKDOWN = 'text/markdown; charset=UTF-8';
 const SNAPSHOT_PATH = '/api/content/snapshot.tar.gz';
+// The server re-exports the host before streaming it: a large site takes a while.
+const SNAPSHOT_TIMEOUT_MS = 120_000;
 
 /**
  * Upload formats, by extension: the list pushword/core accepts
@@ -27,7 +29,9 @@ export const DEFAULT_MAX_MEDIA_BYTES = 50 * 1024 * 1024;
  *
  * Built to be extended: no private fields, every call goes through
  * `this.http`. `token` and `snapshotKey` are strings or functions (sync or
- * async) resolved at each request.
+ * async) resolved at each request. With a snapshot key, the snapshot is
+ * fetched with that read-only key alone: the editor token is neither needed
+ * nor sent. `snapshotTimeoutMs` bounds a snapshot download (2 minutes).
  */
 export class PushwordClient {
   constructor({
@@ -40,12 +44,14 @@ export class PushwordClient {
     httpOptions = {},
     mediaTypes = MEDIA_TYPES,
     maxMediaBytes = DEFAULT_MAX_MEDIA_BYTES,
+    snapshotTimeoutMs = SNAPSHOT_TIMEOUT_MS,
   } = {}) {
     if (!baseUrl && !http) {
       throw new Error('Adresse de l’API Pushword manquante.');
     }
     this.baseUrl = String(baseUrl || http.baseUrl).replace(/\/+$/, '');
     this.snapshotKey = snapshotKey;
+    this.snapshotTimeoutMs = snapshotTimeoutMs;
     this.mediaTypes = mediaTypes;
     this.maxMediaBytes = maxMediaBytes;
     this.http = http || new HttpClient({ baseUrl: this.baseUrl, token, userAgent, fetchImpl, ...httpOptions });
@@ -120,8 +126,9 @@ export class PushwordClient {
   }
 
   /**
-   * Stream the host's flat export (tar.gz) to `destination`. The snapshot key
-   * and the token never follow a redirect to another origin.
+   * Stream the host's flat export (tar.gz) to `destination`, with the snapshot
+   * key alone when there is one, else with the editor token. Neither follows a
+   * redirect to another origin.
    */
   async downloadSnapshot(host, destination) {
     validateHost(host);
@@ -129,7 +136,8 @@ export class PushwordClient {
     const response = await this.http.send('GET', `${SNAPSHOT_PATH}?host=${encodeURIComponent(host)}`, {
       accept: 'application/gzip',
       headers: key ? { 'X-Pushword-Snapshot-Key': key } : {},
-      timeoutMs: 120_000,
+      auth: !key,
+      timeoutMs: this.snapshotTimeoutMs,
     });
     if (!response.ok || !response.body) {
       const payload = await parseResponse(response).catch(() => null);

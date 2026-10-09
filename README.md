@@ -75,8 +75,17 @@ serveur, et `git -C content diff last-pull` montre tout ce qui a changé depuis
 le pull. Le hook et `syncAll()` ne poussent que les hôtes du projet ; un
 fichier nommé exprès (`anyHost: true`) part quel que soit son hôte. Le
 snapshot n'installe que les `.md`, `redirection.csv` et les `index*.csv`, jamais
-`AGENTS.md` ni `CLAUDE.md`. `onPulled({ host, directory })` ajoute une étape
+`AGENTS.md` ni `CLAUDE.md`. Il part avec la clé de snapshot seule quand le
+projet en a une (`snapshotKey`), sinon avec le jeton ; `snapshotTimeoutMs` borne
+son téléchargement (2 minutes). `onPulled({ host, directory })` ajoute une étape
 propre au projet après chaque pull.
+
+Chaque résultat de `sync()` porte `status` (`synced`, `conflict`, `auth`,
+`no-revision`, `outside-hosts`, `error`), `message`, et pour un refus HTTP
+`httpStatus` et `responseText` : un projet peut écrire ses propres messages.
+Les erreurs se reconnaissent à leur `code`, jamais à leur texte :
+`UNSYNCED_CHANGES` et `EMPTY_SNAPSHOT` pour un pull, `NETWORK_ERROR` quand
+aucune tentative n'a eu de réponse, `CROSS_ORIGIN_REDIRECT`.
 
 ## Secrets
 
@@ -142,6 +151,7 @@ messages écrits par un agent) se branchent par options.
 | Identité, journal, marque des mails | `MailClient({ authorize, audit, mark })` |
 | Écritures Cadrank auditées | `CadrankClient({ allowWrites, audit })` |
 | Réponses HTTP `{ status, text, json }` | `HttpClient.exchange()` |
+| Messages propres au projet | résultats de `sync()`, `code` des erreurs, `ContentWorkspace#report` |
 | Commandes d'atelier | `runAssistant({ commands, actions, doctor })` |
 
 ## Développement
