@@ -26,6 +26,8 @@ export function createVault({
 }) {
   const fields = () => catalogFields(catalog);
   const fieldByName = (name) => fields().find((item) => item.name === name);
+  // Sources that win over the keychain: a value saved there stays hidden.
+  const shadowingSources = new Set(['environment', 'systemd', ...before.map((extra) => extra.source)]);
 
   function resolve(name, { defaultValue = '' } = {}) {
     validateCredentialName(name);
@@ -93,7 +95,7 @@ export function createVault({
     const missing = missingNames(item, (name) => Boolean(Object.hasOwn(candidate, name) ? candidate[name] : resolve(name).value));
     if (missing.length) throw new VaultError(`Champs manquants : ${missing.map(labelOf).join(', ')}.`);
     for (const entry of item.fields) {
-      validateCredentialValue(candidate[entry.name] || '');
+      validateCredentialValue(candidate[entry.name] || '', entry);
       validateField(entry, candidate[entry.name]);
     }
     return candidate;
@@ -104,9 +106,9 @@ export function createVault({
       const states = item.fields.map((entry) => {
         const resolved = resolve(entry.name, entry);
         let valid = true;
-        try { validateCredentialValue(resolved.value); validateField(entry, resolved.value); } catch { valid = false; }
+        try { validateCredentialValue(resolved.value, entry); validateField(entry, resolved.value); } catch { valid = false; }
         return { name: entry.name, label: entry.label, secret: entry.secret, required: entry.required,
-          configured: Boolean(resolved.value), valid, source: resolved.source };
+          configured: Boolean(resolved.value), valid, source: resolved.source, shadowing: shadowingSources.has(resolved.source) };
       });
       const configured = new Set(states.filter((entry) => entry.configured).map((entry) => entry.name));
       const missing = missingNames(item, (name) => configured.has(name) || (!fieldByName(name) && Boolean(resolve(name).value)));
@@ -119,8 +121,9 @@ export function createVault({
     const item = connectorById(catalog, id);
     const updates = {};
     for (const [name, raw] of Object.entries(submitted)) {
-      if (!item.fields.some((entry) => entry.name === name)) throw new VaultError('Champ inconnu dans le formulaire.');
-      validateCredentialValue(raw);
+      const entry = item.fields.find((candidate) => candidate.name === name);
+      if (!entry) throw new VaultError('Champ inconnu dans le formulaire.');
+      validateCredentialValue(raw, entry);
       const value = raw.trim();
       if (value) updates[name] = value;
     }
@@ -142,7 +145,7 @@ export function createVault({
     const entry = fieldByName(name);
     if (!entry) throw new VaultError(`${name} n’appartient à aucun connecteur du catalogue.`);
     const value = String(raw ?? '').trim();
-    validateCredentialValue(value);
+    validateCredentialValue(value, entry);
     validateField(entry, value);
     keychain.write(name, value);
     return { saved: [name], shadowed: shadowedNames([name]) };
@@ -150,7 +153,7 @@ export function createVault({
 
   // A saved value that still does not resolve from the keychain is hidden by an earlier source.
   function shadowedNames(names) {
-    return names.filter((name) => resolve(name).source !== 'keychain');
+    return names.filter((name) => shadowingSources.has(resolve(name).source));
   }
 
   /** Move this catalog's values stored in the assistant-kit 0.1 keychain format to the shared format. */
@@ -187,7 +190,7 @@ export function createVault({
     for (const [name, value] of parsed) {
       // Never replace a newer local value or an explicit server override.
       if (!['default', 'missing'].includes(resolve(name).source)) { skipped.push(name); continue; }
-      validateCredentialValue(value);
+      validateCredentialValue(value, fieldByName(name));
       validateField(fieldByName(name), value);
       pending.push([name, value]);
     }

@@ -34,11 +34,16 @@ export function validateCredentialName(name) {
   }
 }
 
-/** Values typed in a form or piped on stdin: one line, at most 256 KB. */
-export function validateCredentialValue(value) {
-  if (typeof value !== 'string' || /[\r\n\0]/.test(value) || Buffer.byteLength(value) > MAX_VALUE_BYTES) {
-    throw new VaultError('Une valeur doit tenir sur une ligne et ne pas dépasser 256 Ko.');
+/**
+ * Values typed in a form or piped on stdin: at most 256 KB, one line unless
+ * the field is `multiline` (an HTML signature). Storage is base64url, so line
+ * breaks are safe; the single line rule only catches pasting mistakes.
+ */
+export function validateCredentialValue(value, { multiline = false } = {}) {
+  if (typeof value !== 'string' || value.includes('\0') || Buffer.byteLength(value) > MAX_VALUE_BYTES) {
+    throw new VaultError('Une valeur ne doit pas dépasser 256 Ko.');
   }
+  if (!multiline && /[\r\n]/.test(value)) throw new VaultError('Cette valeur doit tenir sur une ligne.');
 }
 
 // Git executes helper strings through a shell. Accept only a known bare name or

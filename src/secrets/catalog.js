@@ -41,7 +41,8 @@ export function connector(label, description, fields, { link = '', probe = null,
 
 /**
  * kinds: url (HTTPS only), port, host, email (optionally restricted to `domain`),
- * or none (a secret by default).
+ * or none (a secret by default). `multiline: true` accepts line breaks (an HTML
+ * signature) and gets a text area in the form.
  */
 export function field(name, label, options = {}) {
   return Object.freeze({ name, label, secret: !options.kind, defaultValue: '', required: true, help: '', ...options });

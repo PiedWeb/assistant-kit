@@ -218,7 +218,7 @@ function readRequestBody(request) {
     let size = 0;
     request.on('data', (chunk) => {
       size += chunk.length;
-      if (size > 65_536) { reject(new Error('too large')); return; }
+      if (size > 512 * 1024) { reject(new Error('too large')); return; }
       chunks.push(chunk);
     });
     request.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));

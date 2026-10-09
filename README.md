@@ -105,7 +105,9 @@ interrogé sans invite ni réseau ; un trousseau qui ne répond pas lève
 `KeychainUnavailableError` au lieu de passer pour vide. `migrateLegacy()` (CLI :
 `vault migrate-keychain`) reprend les valeurs du format 0.1. Un connecteur peut
 déclarer des exigences alternatives (`requirements: [['A'], ['B']]`), être
-facultatif, et porter toute propriété propre au projet. Les sorties de statut
+facultatif, et porter toute propriété propre au projet. Un champ `multiline`
+(une signature HTML) accepte les retours à la ligne et s'édite dans une zone de
+texte. Les sorties de statut
 et de sonde ne contiennent jamais une valeur, une réponse brute de service ou
 une identité.
 

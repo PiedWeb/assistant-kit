@@ -259,6 +259,44 @@ test('probes report fixed descriptions, never server bodies', async () => {
   assert.equal(unsupported.status, 'unsupported');
 });
 
+test('a multiline field takes an HTML signature, from stdin or the form text area', async (t) => {
+  const git = fakeGit();
+  git.store.set('secrets-shared.invalid/configuration-v2', manifest(['MAIL_PASSWORD']));
+  git.store.set('secrets-shared.invalid/valeur-v2-MAIL_PASSWORD', encoded('shared-password'));
+  const signed = defineCatalog({
+    mail: connector('Mail', 'Boîte', [
+      field('MAIL_PASSWORD', 'Mot de passe'),
+      field('MAIL_SIGNATURE_HTML', 'Signature HTML', { secret: false, required: false, multiline: true }),
+    ]),
+  });
+  const vault = createVault({
+    catalog: signed, environment: {},
+    keychain: createKeychain({ namespace: NAMESPACE, run: git.run, environment: {}, sleep: noSleep }),
+    after: [sharedKeychainSource(createKeychain({ namespace: 'secrets-shared.invalid', run: git.run, environment: {}, sleep: noSleep }), ['MAIL_PASSWORD'])],
+  });
+  const signature = '<p>Robin<br>\n<a href="https://example.com">example.com</a></p>\n<p>06 00 00 00 00</p>';
+
+  vault.set('MAIL_SIGNATURE_HTML', signature);
+  assert.equal(vault.resolve('MAIL_SIGNATURE_HTML').value, signature);
+  assert.throws(() => vault.set('MAIL_PASSWORD', 'two\nlines'), /une ligne/);
+
+  const session = await startVaultServer({ vault, autoVerify: false, brand: { name: 'testkit', css: '' } });
+  t.after(() => session.close());
+  const url = new URL(session.url);
+  const html = await (await fetch(url)).text();
+  assert.match(html, /<textarea id="MAIL_SIGNATURE_HTML"[^>]*>&lt;p&gt;Robin/);
+  assert.match(html, /Trousseau partagé \(secrets-shared\.invalid\)/);
+  const csrf = html.match(/name="csrf" value="([^"]+)"/)[1];
+  const replaced = '<p>Robin</p>\r\n<p>Nouvelle ligne</p>';
+  const response = await fetch(url, {
+    method: 'POST', redirect: 'manual',
+    headers: { Origin: url.origin, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ csrf, action: 'save', MAIL_SIGNATURE_HTML: replaced }),
+  });
+  assert.equal(response.status, 303);
+  assert.equal(vault.resolve('MAIL_SIGNATURE_HTML').value, replaced);
+});
+
 test('the vault form only answers its secret path with a CSRF token', async (t) => {
   const git = fakeGit();
   const vault = createVault({ catalog: catalog(), environment: {}, keychain: createKeychain({ namespace: NAMESPACE, run: git.run, environment: {} }) });

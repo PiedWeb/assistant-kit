@@ -24,7 +24,7 @@ export async function probeConnector(catalog, id, values, { timeoutMs = 12_000, 
   }
   try {
     for (const entry of item.fields) {
-      validateCredentialValue(values[entry.name] || '');
+      validateCredentialValue(values[entry.name] || '', entry);
       validateField(entry, values[entry.name]);
     }
   } catch { return result('unconfigured', 'Corrigez les champs invalides avant de tester l’accès.'); }
