@@ -159,8 +159,8 @@ async function doctor({ settings, vault }) {
     let mirror = 'jamais tiré';
     if (marker && fs.existsSync(marker)) {
       mirror = `tiré le ${fs.statSync(marker).mtime.toLocaleString('fr-FR')}`;
-      const pending = workspace.modifiedSincePull().length;
-      if (pending) mirror += `, ${pending} page(s) modifiée(s) depuis`;
+      const pending = workspace.pendingFiles().length;
+      if (pending) mirror += `, ${pending} page(s) à synchroniser`;
     }
     lines.unshift(['API Pushword', workspace.client.baseUrl]);
     lines.push(['Miroir content/', mirror]);
