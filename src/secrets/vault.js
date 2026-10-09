@@ -4,17 +4,36 @@ import { catalogFields, connectorById, validateField, VaultError } from './catal
 import { validateCredentialName, validateCredentialValue } from './keychain.js';
 
 /**
- * One logical vault per project. A value resolves, in order, from the
- * environment, a systemd credential (`CREDENTIALS_DIRECTORY`), the keychain,
- * then the catalog default. Statuses report where each value comes from,
- * never the value itself.
+ * Read only `names` from another scope's keychain, after the project's own
+ * values: a mailbox shared by two workspaces is configured once.
  */
-export function createVault({ catalog, keychain, environment = process.env, aliases = {}, configureHint = 'vault configure' }) {
+export function sharedKeychainSource(keychain, names) {
+  const allowed = new Set(names);
+  return { source: `keychain:${keychain.namespace}`, read: (name) => (allowed.has(name) ? keychain.read(name) : '') };
+}
+
+/**
+ * One logical vault per project. A value resolves, in order, from the
+ * environment, a systemd credential (`CREDENTIALS_DIRECTORY`), the `before`
+ * sources, the keychain, the `after` sources, then the catalog default.
+ * A source is `{ source, read(name) }`: projects add their own (a shared
+ * configuration file, another scope's keychain). Statuses report where each
+ * value comes from, never the value itself.
+ */
+export function createVault({
+  catalog, keychain, environment = process.env, aliases = {}, configureHint = 'vault configure',
+  before = [], after = [], emptyEnvironmentOverrides = false,
+}) {
   const fields = () => catalogFields(catalog);
   const fieldByName = (name) => fields().find((item) => item.name === name);
 
   function resolve(name, { defaultValue = '' } = {}) {
     validateCredentialName(name);
+    // `emptyEnvironmentOverrides`: a variable set to '' disables the other sources.
+    if (emptyEnvironmentOverrides && Object.hasOwn(environment, name)) {
+      const value = String(environment[name] || '').trim();
+      return { value, source: value ? 'environment' : 'missing' };
+    }
     const environmentValue = String(environment[name] || '').trim();
     if (environmentValue) return { value: environmentValue, source: 'environment' };
     const directory = String(environment.CREDENTIALS_DIRECTORY || '').trim();
@@ -26,8 +45,16 @@ export function createVault({ catalog, keychain, environment = process.env, alia
         if (error.code !== 'ENOENT') throw new VaultError(`Credential systemd illisible : ${name}.`);
       }
     }
+    for (const extra of before) {
+      const value = String(extra.read(name) || '').trim();
+      if (value) return { value, source: extra.source };
+    }
     const stored = keychain.read(name);
     if (stored) return { value: stored, source: 'keychain' };
+    for (const extra of after) {
+      const value = String(extra.read(name) || '').trim();
+      if (value) return { value, source: extra.source };
+    }
     const fallback = defaultValue || fieldByName(name)?.defaultValue || '';
     return { value: fallback, source: fallback ? 'default' : 'missing' };
   }
@@ -43,10 +70,28 @@ export function createVault({ catalog, keychain, environment = process.env, alia
     return Object.fromEntries(connectorById(catalog, id).fields.map((item) => [item.name, resolve(item.name, item).value]));
   }
 
+  /**
+   * Names still missing. A connector may declare `requirements`, alternative
+   * groups of names (any complete group is enough, as in GrandAngle's catalog);
+   * otherwise every `required` field is needed.
+   */
+  function missingNames(item, configured) {
+    if (Array.isArray(item.requirements) && item.requirements.length) {
+      const gaps = item.requirements.map((group) => group.filter((name) => !configured(name)));
+      if (gaps.some((gap) => !gap.length)) return [];
+      return gaps.reduce((best, gap) => (gap.length < best.length ? gap : best));
+    }
+    return item.fields.filter((entry) => entry.required && !configured(entry.name)).map((entry) => entry.name);
+  }
+
+  function labelOf(name) {
+    return fieldByName(name)?.label || name;
+  }
+
   function validate(id, candidate) {
     const item = connectorById(catalog, id);
-    const missing = item.fields.filter((entry) => entry.required && !candidate[entry.name]);
-    if (missing.length) throw new VaultError(`Champs manquants : ${missing.map((entry) => entry.label).join(', ')}.`);
+    const missing = missingNames(item, (name) => Boolean(Object.hasOwn(candidate, name) ? candidate[name] : resolve(name).value));
+    if (missing.length) throw new VaultError(`Champs manquants : ${missing.map(labelOf).join(', ')}.`);
     for (const entry of item.fields) {
       validateCredentialValue(candidate[entry.name] || '');
       validateField(entry, candidate[entry.name]);
@@ -63,9 +108,10 @@ export function createVault({ catalog, keychain, environment = process.env, alia
         return { name: entry.name, label: entry.label, secret: entry.secret, required: entry.required,
           configured: Boolean(resolved.value), valid, source: resolved.source };
       });
-      const missing = states.filter((entry) => entry.required && !entry.configured).map((entry) => entry.name);
+      const configured = new Set(states.filter((entry) => entry.configured).map((entry) => entry.name));
+      const missing = missingNames(item, (name) => configured.has(name) || (!fieldByName(name) && Boolean(resolve(name).value)));
       const invalid = states.filter((entry) => !entry.valid).map((entry) => entry.name);
-      return { id, label: item.label, ready: !missing.length && !invalid.length, missing, invalid, fields: states };
+      return { id, label: item.label, optional: Boolean(item.optional), ready: !missing.length && !invalid.length, missing, invalid, fields: states };
     });
   }
 
@@ -79,18 +125,16 @@ export function createVault({ catalog, keychain, environment = process.env, alia
       if (value) updates[name] = value;
     }
     validate(id, { ...values(id), ...updates });
-    const saved = [];
+    if (!Object.keys(updates).length) return { saved: [], shadowed: [] };
+    let saved;
     try {
-      for (const [name, value] of Object.entries(updates)) {
-        keychain.write(name, value);
-        saved.push(name);
-      }
-    } catch {
+      ({ saved } = keychain.save(updates));
+    } catch (error) {
       keychain.refresh();
-      throw new VaultError(`Enregistrement interrompu après ${saved.length} valeur(s) confirmée(s). Vérifiez le trousseau puis réessayez ; certaines valeurs peuvent déjà avoir été enregistrées.`);
+      if (error instanceof VaultError) throw error;
+      throw new VaultError('Enregistrement interrompu. Vérifiez le trousseau puis réessayez ; certaines valeurs peuvent déjà avoir été enregistrées.');
     }
-    const shadowed = saved.filter((name) => ['environment', 'systemd'].includes(resolve(name).source));
-    return { saved, shadowed };
+    return { saved, shadowed: shadowedNames(Object.keys(updates)) };
   }
 
   /** Store one catalog value, for scripted setup (read the value from stdin, never argv). */
@@ -101,7 +145,17 @@ export function createVault({ catalog, keychain, environment = process.env, alia
     validateCredentialValue(value);
     validateField(entry, value);
     keychain.write(name, value);
-    return { saved: [name], shadowed: ['environment', 'systemd'].includes(resolve(name).source) ? [name] : [] };
+    return { saved: [name], shadowed: shadowedNames([name]) };
+  }
+
+  // A saved value that still does not resolve from the keychain is hidden by an earlier source.
+  function shadowedNames(names) {
+    return names.filter((name) => resolve(name).source !== 'keychain');
+  }
+
+  /** Move this catalog's values stored in the assistant-kit 0.1 keychain format to the shared format. */
+  function migrateKeychain() {
+    return keychain.migrateLegacy(fields().map((entry) => entry.name));
   }
 
   function forget(name) {
@@ -132,7 +186,7 @@ export function createVault({ catalog, keychain, environment = process.env, alia
     keychain.refresh();
     for (const [name, value] of parsed) {
       // Never replace a newer local value or an explicit server override.
-      if (['environment', 'systemd', 'keychain'].includes(resolve(name).source)) { skipped.push(name); continue; }
+      if (!['default', 'missing'].includes(resolve(name).source)) { skipped.push(name); continue; }
       validateCredentialValue(value);
       validateField(fieldByName(name), value);
       pending.push([name, value]);
@@ -140,10 +194,10 @@ export function createVault({ catalog, keychain, environment = process.env, alia
     const migrated = [];
     if (!dryRun) {
       try {
-        for (const [name, value] of pending) { keychain.write(name, value); migrated.push(name); }
+        if (pending.length) migrated.push(...keychain.save(Object.fromEntries(pending)).saved);
       } catch {
         keychain.refresh();
-        throw new VaultError(`Migration interrompue après ${migrated.length} valeur(s) confirmée(s). Le fichier source est conservé ; relancez la migration après vérification du trousseau.`);
+        throw new VaultError('Migration interrompue. Le fichier source est conservé ; relancez la migration après vérification du trousseau.');
       }
     }
     return { dryRun, pending: pending.map(([name]) => name).sort(), migrated: migrated.sort(), skipped: skipped.sort() };
@@ -160,6 +214,7 @@ export function createVault({ catalog, keychain, environment = process.env, alia
     set,
     forget,
     migrate,
+    migrateKeychain,
     assertReady: (id) => validate(id, values(id)),
     backend: () => keychain.status(),
     refresh: () => keychain.refresh(),

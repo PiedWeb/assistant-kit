@@ -24,8 +24,19 @@ export function defineCatalog(connectors) {
   return Object.freeze({ ...connectors });
 }
 
-export function connector(label, description, fields, { link = '', probe = null } = {}) {
-  return Object.freeze({ label, description, fields: Object.freeze(fields), link, probe });
+/**
+ * Options: `link`, `probe`, `requirements` (alternative groups of names, any
+ * complete group makes the connector ready), `optional`. Any other property
+ * is kept as is, for the project's own use (GrandAngle: planets, allowed users).
+ */
+export function connector(label, description, fields, { link = '', probe = null, requirements = null, optional = false, ...extra } = {}) {
+  if (requirements !== null && (!Array.isArray(requirements) || requirements.some((group) => !Array.isArray(group) || !group.length))) {
+    throw new VaultError(`Exigences invalides pour ${label}.`);
+  }
+  return Object.freeze({
+    ...extra, label, description, fields: Object.freeze(fields), link, probe,
+    requirements: requirements && Object.freeze(requirements.map((group) => Object.freeze([...group]))), optional,
+  });
 }
 
 /**
