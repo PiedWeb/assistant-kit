@@ -25,6 +25,7 @@
     "./cadrank": "./src/cadrank.js",
     "./mail": "./src/mail.js",
     "./cli": "./src/cli.js",
+    "./audit": "./src/audit.js",
     "./assistant": "./src/assistant.js",
     "./package.json": "./package.json"
   },
