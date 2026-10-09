@@ -1,5 +1,6 @@
 import { connectorById, validateField } from './catalog.js';
 import { validateCredentialValue } from './keychain.js';
+import { MailClient } from '../mail.js';
 
 export const PROBE_LABELS = Object.freeze({
   unconfigured: 'À compléter', idle: 'Non testé', running: 'Test en cours',
@@ -132,35 +133,55 @@ export function davProbe({ url, user, password }) {
   };
 }
 
-/** IMAP login then SMTP verify. Sends nothing. */
-export function mailProbe({ host, imapPort, smtpPort, user, password }) {
+/**
+ * IMAP LIST then SMTP verify through MailClient, for every account of the
+ * configuration (or only `account(values)`). Read-only: no write is possible
+ * (allowWrites stays false) and nothing is sent. `configuration(values)`
+ * returns the accounts JSON shared with MailClient, an `{ accounts }` object
+ * or an array. The detail never names an account, a server or an address.
+ */
+export function mailProbe({ configuration, account = null, allowedDomains = [] } = {}) {
+  if (typeof configuration !== 'function') throw new TypeError('mailProbe attend configuration(values).');
   return async (values, { signal, timeoutMs, imapFactory, smtpFactory }) => {
-    let imap;
-    let smtp;
-    const close = () => { try { imap?.close(); } catch {} try { smtp?.close(); } catch {} };
+    const opened = new Set();
+    const track = (factory) => async (options) => {
+      const resource = await factory(options);
+      opened.add(resource);
+      return resource;
+    };
+    const close = () => { for (const resource of opened) { try { resource.close?.(); } catch {} } };
     signal.addEventListener('abort', close, { once: true });
     try {
-      const auth = { user: user(values), pass: password(values) };
-      const timeouts = { connectionTimeout: timeoutMs, greetingTimeout: timeoutMs, socketTimeout: timeoutMs };
-      const createImap = imapFactory || (async (config) => new (await import('imapflow')).ImapFlow(config));
-      const createSmtp = smtpFactory || (async (config) => (await import('nodemailer')).default.createTransport(config));
-      imap = await createImap({ host: host(values), port: Number(imapPort(values)), secure: true, auth, logger: false, ...timeouts });
-      signal.throwIfAborted();
-      await imap.connect();
-      await imap.logout();
-      signal.throwIfAborted();
-      const port = Number(smtpPort(values));
-      smtp = await createSmtp({ host: host(values), port, secure: port === 465, requireTLS: port !== 465,
-        auth, logger: false, debug: false, ...timeouts });
-      signal.throwIfAborted();
-      await smtp.verify();
-      return 'Connexions IMAP et SMTP acceptées. Aucun message envoyé.';
+      const client = new MailClient({
+        configuration: configuration(values),
+        allowedDomains,
+        timeout: timeoutMs,
+        imapFactory: track(imapFactory || defaultMailFactories.imap),
+        smtpFactory: track(smtpFactory || defaultMailFactories.smtp),
+      });
+      const wanted = account ? [String(account(values) || '')] : (await client.accounts()).map((item) => item.id);
+      if (!wanted.length) throw new Error('no mail account');
+      for (const id of wanted) {
+        signal.throwIfAborted();
+        await client.verify(id);
+      }
+      return wanted.length > 1
+        ? `Connexions IMAP et SMTP acceptées pour ${wanted.length} boîtes. Aucun message envoyé.`
+        : 'Connexions IMAP et SMTP acceptées. Aucun message envoyé.';
     } finally {
       signal.removeEventListener('abort', close);
       close();
     }
   };
 }
+
+const defaultMailFactories = Object.freeze({
+  imap: async (options) => new (await import('imapflow')).ImapFlow(options),
+  smtp: async (options) => {
+    const nodemailer = await import('nodemailer');
+    return (nodemailer.createTransport ? nodemailer : nodemailer.default).createTransport(options);
+  },
+});
 
 // Credentials must never follow a redirect or leave over unencrypted HTTP.
 function safeUrl(address) {

@@ -1,193 +1,940 @@
 /**
- * IMAP read and SMTP send for named accounts. Reading never marks a message
- * as seen unless asked; sending always uses the account's own address.
+ * Personal mailboxes reached with standard IMAP and SMTP credentials.
  *
- * accounts: { personal: { address, password } }, allowedDomains: ['example.com']
+ * Accounts use the `{ version: 2, accounts: [...] }` JSON shared with other
+ * consumers through the keychain (a bare array is accepted too). Reads open
+ * mailboxes with EXAMINE and never change a flag. Nothing is written to a
+ * mailbox (draft, send, reply) unless the caller passes `allowWrites: true`.
+ *
+ * Project specifics plug in through options, never through this file:
+ * `authorize` (identity check before the first operation), `audit` (one entry
+ * per write, without content), `mark` (agent signature and header),
+ * `allowedDomains` (account addresses this project may use).
+ *
+ * imapflow, nodemailer and mailparser load lazily, inside the methods that
+ * need them: importing this module (or the vault probes) never loads them.
  */
-export class MailClient {
-  constructor({ host, imapPort = 993, smtpPort = 587, accounts, allowedDomains = [], imapFactory, smtpFactory }) {
-    this.host = host;
-    this.imapPort = imapPort;
-    this.smtpPort = smtpPort;
-    this.accounts = accounts;
-    this.allowedDomains = allowedDomains.map((domain) => domain.toLowerCase());
-    this.imapFactory = imapFactory || defaultImapFactory;
-    this.smtpFactory = smtpFactory || defaultSmtpFactory;
-  }
+import { randomUUID } from 'node:crypto';
+import { mkdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 
-  async folders(accountName) {
-    return this.withImap(accountName, async (client) => (await client.list()).map((folder) => ({
-      path: folder.path,
-      name: folder.name,
-      specialUse: folder.specialUse || null,
-    })));
-  }
+export const MAX_ACCOUNTS = 20;
+export const MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
+export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const MAX_SIGNATURE_HTML = 100000;
+const MAX_RECIPIENTS = 50;
+const MAX_ATTACHMENTS = 10;
+const MAX_BODY_CHARACTERS = 100000;
+const MASK = '«valeur masquée»';
+// imapflow infers specialUse from folder names too; the patterns only catch the
+// servers it misses. `flags` are set on the copy appended there.
+const SENT_FOLDER = Object.freeze({
+  specialUse: '\\Sent', label: 'Envoyés', flags: Object.freeze(['\\Seen']),
+  names: /^(?:sent|sent items|envoy[eé]s|messages envoy[eé]s)$/i,
+});
+const DRAFTS_FOLDER = Object.freeze({
+  specialUse: '\\Drafts', label: 'Brouillons', flags: Object.freeze(['\\Draft', '\\Seen']),
+  names: /^(?:drafts?|brouillons?)$/i,
+});
 
-  async list(accountName, { mailbox = 'INBOX', limit = 25, unseen = false } = {}) {
-    return this.withImap(accountName, async (client) => {
-      const lock = await client.getMailboxLock(mailbox);
-      try {
-        const total = client.mailbox.exists;
-        if (total === 0) {
-          return [];
-        }
-        const start = Math.max(1, total - Math.max(limit * 3, limit) + 1);
-        const messages = [];
-        for await (const message of client.fetch(`${start}:*`, {
-          uid: true, envelope: true, flags: true, internalDate: true, size: true,
-        })) {
-          if (unseen && message.flags?.has('\\Seen')) {
-            continue;
-          }
-          messages.push(normaliseMessage(message));
-        }
-        return messages.slice(-limit).reverse();
-      } finally {
-        lock.release();
-      }
-    });
-  }
-
-  async search(accountName, query, { mailbox = 'INBOX', limit = 25 } = {}) {
-    return this.withImap(accountName, async (client) => {
-      const lock = await client.getMailboxLock(mailbox);
-      try {
-        const uids = await client.search({ or: [{ subject: query }, { from: query }, { body: query }] }, { uid: true });
-        const wanted = (uids || []).slice(-limit);
-        if (!wanted.length) {
-          return [];
-        }
-        const messages = [];
-        for await (const message of client.fetch(wanted.join(','), {
-          uid: true, envelope: true, flags: true, internalDate: true, size: true,
-        }, { uid: true })) {
-          messages.push(normaliseMessage(message));
-        }
-        return messages.reverse();
-      } finally {
-        lock.release();
-      }
-    });
-  }
-
-  async read(accountName, uid, { mailbox = 'INBOX', markSeen = false } = {}) {
-    return this.withImap(accountName, async (client) => {
-      const lock = await client.getMailboxLock(mailbox);
-      try {
-        const message = await client.fetchOne(Number(uid), {
-          uid: true, envelope: true, flags: true, internalDate: true, source: true,
-        }, { uid: true });
-        if (!message) {
-          throw new Error(`Message IMAP introuvable : ${uid}`);
-        }
-        if (markSeen) {
-          await client.messageFlagsAdd(Number(uid), ['\\Seen'], { uid: true });
-        }
-        return { ...normaliseMessage(message), source: message.source?.toString('utf8') || '' };
-      } finally {
-        lock.release();
-      }
-    });
-  }
-
-  async send(accountName, message) {
-    const account = this.account(accountName);
-    if (!message.to || !message.subject || (!message.text && !message.html)) {
-      throw new Error('Un destinataire, un sujet et un corps texte ou HTML sont obligatoires.');
-    }
-    if (message.from && normaliseAddress(message.from) !== normaliseAddress(account.address)) {
-      throw new Error(`L’expéditeur doit être ${account.address}.`);
-    }
-    const transport = await this.smtpFactory(this.smtpConfig(account));
-    await transport.verify();
-    return transport.sendMail({ ...message, from: account.address });
-  }
-
-  async verify(accountName) {
-    const account = this.account(accountName);
-    await this.withImap(accountName, async () => undefined);
-    const smtp = await this.smtpFactory(this.smtpConfig(account));
-    await smtp.verify();
-    return { account: account.address, imap: true, smtp: true };
-  }
-
-  account(name) {
-    const account = this.accounts[name];
-    if (!account) {
-      throw new Error(`Boîte inconnue : ${name}. Boîtes configurées : ${Object.keys(this.accounts).join(', ')}.`);
-    }
-    if (!account.address || !account.password) {
-      throw new Error(`Identifiants incomplets pour la boîte ${name}.`);
-    }
-    const domain = account.address.split('@').pop().toLowerCase();
-    if (this.allowedDomains.length && !this.allowedDomains.includes(domain)) {
-      throw new Error(`Adresse hors des domaines autorisés : ${account.address}`);
-    }
-    return account;
-  }
-
-  async withImap(accountName, work) {
-    const account = this.account(accountName);
-    const client = await this.imapFactory(this.imapConfig(account));
-    await client.connect();
-    try {
-      return await work(client);
-    } finally {
-      await client.logout().catch(() => undefined);
-    }
-  }
-
-  imapConfig(account) {
-    return {
-      host: this.host,
-      port: this.imapPort,
-      secure: true,
-      auth: { user: account.address, pass: account.password },
-      logger: false,
-    };
-  }
-
-  smtpConfig(account) {
-    return {
-      host: this.host,
-      port: this.smtpPort,
-      secure: this.smtpPort === 465,
-      requireTLS: this.smtpPort !== 465,
-      auth: { user: account.address, pass: account.password },
-    };
+/**
+ * Only fixed, non-sensitive fields survive from the original error: `code`
+ * (EAUTH, ETIMEDOUT...) and `authenticationFailed`, so that probes can tell a
+ * refused login from a network failure. The original error is never kept as
+ * `cause`: its message may carry a credential.
+ */
+export class MailError extends Error {
+  constructor(message, { code = '', authenticationFailed = false } = {}) {
+    super(message);
+    this.name = 'MailError';
+    if (code) this.code = code;
+    if (authenticationFailed) this.authenticationFailed = true;
   }
 }
 
-async function defaultImapFactory(config) {
-  const { ImapFlow } = await import('imapflow');
-  return new ImapFlow(config);
+function requiredText(value, label, max = 255) {
+  const text = String(value || '').trim();
+  if (!text) throw new MailError(`${label} est requis.`);
+  if (text.length > max) throw new MailError(`${label} dépasse ${max} caractères.`);
+  return text;
 }
 
-async function defaultSmtpFactory(config) {
-  const nodemailer = await import('nodemailer');
-  return nodemailer.default.createTransport(config);
+function host(value, label) {
+  const text = requiredText(value, label, 253).toLowerCase();
+  if (!/^[a-z0-9](?:[a-z0-9.:-]*[a-z0-9])?$/i.test(text) || text.includes('..')) {
+    throw new MailError(`${label} n’est pas un nom de serveur valide.`);
+  }
+  return text;
 }
 
-function normaliseMessage(message) {
+function port(value, label) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1 || number > 65535) {
+    throw new MailError(`${label} doit être compris entre 1 et 65535.`);
+  }
+  return number;
+}
+
+function security(value, label) {
+  const mode = String(value || '').trim().toLowerCase();
+  if (!['tls', 'starttls'].includes(mode)) {
+    throw new MailError(`${label} doit être TLS direct ou STARTTLS.`);
+  }
+  return mode;
+}
+
+function email(value, label) {
+  const address = requiredText(value, label, 254).toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address)) {
+    throw new MailError(`${label} n’est pas une adresse e-mail valide.`);
+  }
+  return address;
+}
+
+function optionalHtml(value, label, max = MAX_SIGNATURE_HTML) {
+  const html = String(value || '').trim();
+  if (html.length > max) throw new MailError(`${label} dépasse ${max} caractères.`);
+  return html;
+}
+
+/** One account of the shared JSON, validated and frozen. */
+export function normalizeAccount(input, { requirePassword = true } = {}) {
+  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const id = requiredText(source.id, 'L’identifiant de boîte', 50).toLowerCase();
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) {
+    throw new MailError('L’identifiant de boîte doit contenir lettres minuscules, chiffres et tirets.');
+  }
+  const password = String(source.password || '');
+  if (requirePassword && !password) throw new MailError(`Le mot de passe de ${id} est requis.`);
+  if (password.length > 4096) throw new MailError(`Le mot de passe de ${id} est trop long.`);
+  return Object.freeze({
+    id,
+    label: requiredText(source.label || id, `Le libellé de ${id}`, 100),
+    address: email(source.address, `L’adresse de ${id}`),
+    username: requiredText(source.username, `L’identifiant de connexion de ${id}`, 254),
+    password,
+    signatureHtml: optionalHtml(source.signatureHtml, `La signature HTML de ${id}`),
+    default: Boolean(source.default),
+    imap: Object.freeze({
+      host: host(source.imap?.host, `Le serveur IMAP de ${id}`),
+      port: port(source.imap?.port, `Le port IMAP de ${id}`),
+      security: security(source.imap?.security, `La sécurité IMAP de ${id}`),
+    }),
+    smtp: Object.freeze({
+      host: host(source.smtp?.host, `Le serveur SMTP de ${id}`),
+      port: port(source.smtp?.port, `Le port SMTP de ${id}`),
+      security: security(source.smtp?.security, `La sécurité SMTP de ${id}`),
+    }),
+  });
+}
+
+/** Unique ids, exactly one default (the first account when none is marked). */
+export function normalizeAccounts(accounts, options = {}) {
+  if (!Array.isArray(accounts) || !accounts.length) {
+    throw new MailError('Configure au moins une boîte mail.');
+  }
+  if (accounts.length > MAX_ACCOUNTS) {
+    throw new MailError(`Au maximum ${MAX_ACCOUNTS} boîtes mail peuvent être configurées.`);
+  }
+  const normalized = accounts.map((item) => normalizeAccount(item, options));
+  const ids = new Set();
+  for (const account of normalized) {
+    if (ids.has(account.id)) throw new MailError(`Identifiant de boîte dupliqué : ${account.id}.`);
+    ids.add(account.id);
+  }
+  const defaults = normalized.filter((account) => account.default);
+  if (defaults.length > 1) throw new MailError('Une seule boîte mail peut être définie par défaut.');
+  if (!defaults.length) {
+    return normalized.map((account, index) => Object.freeze({ ...account, default: index === 0 }));
+  }
+  return normalized;
+}
+
+/** Stored value (JSON string, `{ accounts }` object or bare array) to accounts. */
+export function parseAccountConfig(value, options = {}) {
+  let parsed = value;
+  if (typeof value === 'string') {
+    try { parsed = JSON.parse(value); } catch {
+      throw new MailError('La configuration SMTP/IMAP enregistrée est illisible.');
+    }
+  }
+  const accounts = Array.isArray(parsed) ? parsed : parsed?.accounts;
+  return normalizeAccounts(accounts, options);
+}
+
+export function stringifyAccountConfig(accounts, options = {}) {
+  return JSON.stringify({ version: 2, accounts: normalizeAccounts(accounts, options) });
+}
+
+/** What may be shown to an agent: no username, password or signature HTML. */
+export function publicAccount(account) {
   return {
-    uid: message.uid,
-    date: message.internalDate?.toISOString?.() || null,
-    subject: message.envelope?.subject || '',
-    from: formatAddresses(message.envelope?.from),
-    to: formatAddresses(message.envelope?.to),
-    seen: message.flags?.has('\\Seen') || false,
-    size: message.size || null,
+    id: account.id,
+    label: account.label,
+    address: account.address,
+    default: account.default,
+    hasSignature: Boolean(account.signatureHtml),
+    imap: { ...account.imap },
+    smtp: { ...account.smtp },
   };
 }
 
-function formatAddresses(addresses = []) {
-  return addresses.map((address) => ({
-    name: address.name || '',
-    address: address.address || `${address.mailbox || ''}@${address.host || ''}`,
-  }));
+function escapeHtml(value) {
+  return String(value || '').replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[character]);
 }
 
-function normaliseAddress(address) {
-  const match = String(address).match(/<([^>]+)>/);
-  return (match?.[1] || String(address)).trim().toLowerCase();
+function decodeHtmlEntities(value) {
+  const codePoint = (match, raw, radix) => {
+    const number = parseInt(raw, radix);
+    return Number.isInteger(number) && number >= 0 && number <= 0x10ffff ? String.fromCodePoint(number) : match;
+  };
+  return String(value || '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&#(\d+);/g, (match, code) => codePoint(match, code, 10))
+    .replace(/&#x([0-9a-f]+);/gi, (match, code) => codePoint(match, code, 16));
+}
+
+export function htmlToPlainText(value) {
+  return decodeHtmlEntities(String(value || '')
+    .replace(/<\s*br\s*\/?\s*>/gi, '\n')
+    .replace(/<\s*li(?:\s[^>]*)?>/gi, '- ')
+    .replace(/<\s*\/(?:p|div|li|tr|h[1-6])\s*>/gi, '\n')
+    .replace(/<[^>]*>/g, ''))
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function textToHtml(value) {
+  return escapeHtml(value).replace(/\r?\n/g, '<br>');
+}
+
+function replySubject(value) {
+  const subject = String(value || '(sans objet)').trim() || '(sans objet)';
+  return /^(?:re|r[eé]|aw)\s*:/i.test(subject) ? subject : `Re: ${subject}`;
+}
+
+function referenceList(value) {
+  return (Array.isArray(value) ? value : [value])
+    .flatMap((entry) => String(entry || '').split(/\s+/))
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function quotedMessage(metadata, parsed) {
+  const envelope = metadata.envelope || {};
+  const sender = parsedAddresses(parsed.from)[0] || addressList(envelope.from)[0] || {};
+  const senderLabel = sender.name && sender.address
+    ? `${sender.name} <${sender.address}>`
+    : (sender.address || sender.name || 'Expéditeur inconnu');
+  const rawDate = parsed.date || envelope.date;
+  const date = rawDate ? new Date(rawDate) : null;
+  const dateLabel = date && !Number.isNaN(date.getTime())
+    ? new Intl.DateTimeFormat('fr-FR', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Europe/Paris' }).format(date)
+    : 'date inconnue';
+  const heading = `Le ${dateLabel}, ${senderLabel} a écrit :`;
+  // Only the text is quoted: the remote HTML is untrusted and never copied.
+  const original = String(parsed.text || htmlToPlainText(parsed.html || '') || '(message sans contenu textuel)')
+    .trim().slice(0, MAX_BODY_CHARACTERS);
+  return {
+    text: `${heading}\n${original.split(/\r?\n/).map((line) => `> ${line}`).join('\n')}`,
+    html: `<div class="mail-history"><p>${escapeHtml(heading)}</p>`
+      + '<blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">'
+      + `${textToHtml(original)}</blockquote></div>`,
+  };
+}
+
+function composeBodies(account, { text = '', html = '', quote = null } = {}, mark = null) {
+  let plain = String(text || '').trimEnd();
+  let rich = String(html || '').trim();
+  if (!plain && rich) plain = htmlToPlainText(rich);
+
+  const signatureHtml = String(account.signatureHtml || '').trim();
+  // A signature or a quote needs an HTML part: the text is converted once.
+  if (!rich && text && (signatureHtml || quote)) rich = `<div>${textToHtml(String(text).trimEnd())}</div>`;
+  const signatureText = htmlToPlainText(signatureHtml);
+  if (signatureText) plain += `${plain ? '\n\n' : ''}${signatureText}`;
+  if (signatureHtml) rich += `${rich ? '<br>' : ''}<div class="mail-signature">${signatureHtml}</div>`;
+
+  // The mark closes the new content, above the quoted history.
+  if (mark?.text) plain += `${plain ? '\n\n' : ''}${mark.text}`;
+  if (rich && mark?.html) rich += mark.html;
+
+  if (quote) {
+    plain += `\n\n${quote.text}`;
+    rich += `${rich ? '<br><br>' : ''}${quote.html}`;
+  }
+  return { text: plain, html: rich };
+}
+
+function normalizeMark(mark) {
+  if (!mark) return null;
+  if (typeof mark !== 'object' || Array.isArray(mark)) {
+    throw new MailError('La marque doit être un objet { text, html, header }.');
+  }
+  const text = String(mark.text || '').trim();
+  const html = String(mark.html || '').trim() || (text ? `<p>${escapeHtml(text)}</p>` : '');
+  let header = null;
+  if (mark.header) {
+    const name = String(mark.header.name || '').trim();
+    const value = String(mark.header.value ?? '').trim();
+    // An X- header only: the mark must never replace From, To or Bcc.
+    if (!/^X-[A-Za-z0-9-]{1,74}$/i.test(name)) {
+      throw new MailError('L’en-tête de la marque doit être un en-tête X-… valide.');
+    }
+    if (!value || value.length > 200 || /[\0-\x1f\x7f]/.test(value)) {
+      throw new MailError('La valeur de l’en-tête de la marque doit tenir sur une ligne de 200 caractères au plus.');
+    }
+    header = Object.freeze({ name, value });
+  }
+  return Object.freeze({ text, html, header });
+}
+
+function generatedMessageId(account) {
+  const domain = String(account.address || '').split('@')[1] || 'localhost';
+  return `<${randomUUID()}@${domain}>`;
+}
+
+async function loadNodemailer() {
+  const module = await import('nodemailer');
+  return module.createTransport ? module : module.default;
+}
+
+// The exact MIME bytes appended to Drafts or Sent. A stream transport keeps
+// the Bcc header, so a draft finished later in a mail client still has it.
+async function buildRawMessage(message) {
+  const transport = (await loadNodemailer()).createTransport({ streamTransport: true, buffer: true, newline: 'windows' });
+  try {
+    const result = await transport.sendMail(message);
+    return Buffer.isBuffer(result.message) ? result.message : Buffer.from(result.message || '');
+  } finally {
+    try { transport.close(); } catch {}
+  }
+}
+
+function secretForms(account) {
+  const password = String(account?.password || '');
+  if (password.length < 4) return [];
+  const username = String(account.username || '');
+  return [
+    password,
+    Buffer.from(password).toString('base64'),
+    Buffer.from(`\0${username}\0${password}`).toString('base64'),
+  ];
+}
+
+/** Error message without any account password (plain or base64), on one line. */
+export function redactError(error, accounts = []) {
+  const forms = accounts.flatMap(secretForms);
+  const mask = (text) => forms.reduce((result, value) => result.split(value).join(MASK), text);
+  const source = error && typeof error === 'object' ? error.message : error;
+  return mask(mask(String(source || 'Échec SMTP/IMAP.')).replace(/\s+/g, ' ').trim()).slice(0, 500);
+}
+
+function failure(error, accounts) {
+  const code = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,39}$/.test(error.code) ? error.code : '';
+  return new MailError(redactError(error, accounts), { code, authenticationFailed: error?.authenticationFailed === true });
+}
+
+function addressList(entries) {
+  return (entries || []).flatMap((entry) => {
+    if (!entry) return [];
+    const address = String(entry.address || '').trim().toLowerCase();
+    return address ? [{ name: String(entry.name || ''), address }] : [];
+  });
+}
+
+function envelopeView(message) {
+  const envelope = message.envelope || {};
+  const date = envelope.date ? new Date(envelope.date) : null;
+  return {
+    uid: Number(message.uid),
+    subject: String(envelope.subject || '(sans objet)'),
+    date: date && !Number.isNaN(date.getTime()) ? date.toISOString() : '',
+    from: addressList(envelope.from),
+    to: addressList(envelope.to),
+    cc: addressList(envelope.cc),
+    messageId: String(envelope.messageId || ''),
+    seen: Boolean(message.flags?.has?.('\\Seen')),
+    flagged: Boolean(message.flags?.has?.('\\Flagged')),
+    size: Number(message.size || 0),
+  };
+}
+
+function parsedAddresses(value) {
+  return addressList(Array.isArray(value?.value) ? value.value : []);
+}
+
+// Remote names are untrusted: no directory part on any platform, no control
+// character, never `.` or `..`.
+function safeAttachmentName(value) {
+  const name = String(value || '').split(/[\\/]/).pop().replace(/[\0-\x1f\x7f]/g, '').trim();
+  return name && name !== '.' && name !== '..' ? name.slice(0, 255) : 'piece-jointe';
+}
+
+export function imapOptions(account, timeout) {
+  return {
+    host: account.imap.host,
+    port: account.imap.port,
+    secure: account.imap.security === 'tls',
+    doSTARTTLS: account.imap.security === 'starttls',
+    auth: { user: account.username, pass: account.password },
+    logger: false,
+    disableAutoIdle: true,
+    connectionTimeout: timeout,
+    greetingTimeout: timeout,
+    socketTimeout: Math.max(timeout, 30000),
+    tls: { rejectUnauthorized: true, minVersion: 'TLSv1.2' },
+  };
+}
+
+export function smtpOptions(account, timeout) {
+  return {
+    host: account.smtp.host,
+    port: account.smtp.port,
+    secure: account.smtp.security === 'tls',
+    requireTLS: account.smtp.security === 'starttls',
+    auth: { user: account.username, pass: account.password },
+    logger: false,
+    debug: false,
+    connectionTimeout: timeout,
+    greetingTimeout: timeout,
+    socketTimeout: Math.max(timeout, 30000),
+    tls: { rejectUnauthorized: true, minVersion: 'TLSv1.2' },
+  };
+}
+
+async function defaultImapFactory(options) {
+  const { ImapFlow } = await import('imapflow');
+  return new ImapFlow(options);
+}
+
+async function defaultSmtpFactory(options) {
+  return (await loadNodemailer()).createTransport(options);
+}
+
+async function defaultParser(source, options) {
+  const { simpleParser } = await import('mailparser');
+  return simpleParser(source, options);
+}
+
+function closeQuietly(resource) {
+  try { resource?.close?.(); } catch {}
+}
+
+/**
+ * new MailClient({
+ *   configuration,          // shared JSON string, { accounts } object or array
+ *   accounts,               // or the account array itself (not both)
+ *   allowWrites: false,     // drafts, sends and replies refused unless true
+ *   allowedDomains: [],     // account addresses outside these domains are refused
+ *   authorize: async () => {},   // runs once before the first operation, throws to refuse
+ *   audit: (entry) => {},        // one entry per write attempt, never any content
+ *   mark: { text, html, header: { name, value } },  // optional agent mark
+ *   imapFactory, smtpFactory, parser,   // may be async; tests inject fakes here
+ *   timeout: 12000, maxMessageBytes, configureHint: '',  // hint appended when no account exists
+ * })
+ *
+ * An empty `id` selects the default account. Read results flag remote text as
+ * `untrustedContent`. Errors are MailError, with passwords masked.
+ */
+export class MailClient {
+  #accounts;
+  #allowWrites;
+  #allowedDomains;
+  #authorize;
+  #authorization = null;
+  #audit;
+  #mark;
+  #imapFactory;
+  #smtpFactory;
+  #parser;
+  #configureHint;
+
+  constructor({
+    accounts, configuration, allowWrites = false, allowedDomains = [], authorize = null, audit = null, mark = null,
+    imapFactory = defaultImapFactory, smtpFactory = defaultSmtpFactory, parser = defaultParser,
+    timeout = 12000, maxMessageBytes = MAX_MESSAGE_BYTES, configureHint = '',
+  } = {}) {
+    if (accounts !== undefined && configuration !== undefined) {
+      throw new MailError('Passe accounts ou configuration, pas les deux.');
+    }
+    for (const [name, hook] of Object.entries({ authorize, audit, imapFactory, smtpFactory, parser })) {
+      if (hook !== null && typeof hook !== 'function') throw new MailError(`L’option ${name} doit être une fonction.`);
+    }
+    const source = accounts ?? configuration;
+    this.#accounts = source ? parseAccountConfig(source) : [];
+    this.#allowWrites = allowWrites === true;
+    this.#allowedDomains = Object.freeze([allowedDomains].flat().filter(Boolean)
+      .map((domain) => String(domain).trim().toLowerCase().replace(/^@/, '')));
+    this.#authorize = authorize;
+    this.#audit = audit;
+    this.#mark = normalizeMark(mark);
+    this.#imapFactory = imapFactory;
+    this.#smtpFactory = smtpFactory;
+    this.#parser = parser;
+    this.#configureHint = String(configureHint || '').trim();
+    this.timeout = Math.max(1000, Number(timeout) || 12000);
+    this.maxMessageBytes = Math.max(1024, Number(maxMessageBytes) || MAX_MESSAGE_BYTES);
+  }
+
+  get allowWrites() {
+    return this.#allowWrites;
+  }
+
+  /** Run the `authorize` hook once; a refusal is retried on the next call. */
+  async authorize() {
+    if (!this.#authorize) return;
+    if (!this.#authorization) {
+      // Deferred call: even a synchronous throw rejects after the assignment,
+      // so the reset below is never overwritten by the failed attempt.
+      this.#authorization = Promise.resolve().then(() => this.#authorize()).then(() => undefined, (error) => {
+        this.#authorization = null;
+        throw error instanceof MailError ? error : failure(error, this.#accounts);
+      });
+    }
+    await this.#authorization;
+  }
+
+  async accounts() {
+    await this.authorize();
+    return this.#accounts.filter((account) => this.#domainAllowed(account)).map(publicAccount);
+  }
+
+  async account(id = '') {
+    return publicAccount(await this.#resolve(id));
+  }
+
+  /** IMAP LIST and SMTP EHLO/AUTH: proves both logins without sending anything. */
+  async verify(id = '') {
+    const account = await this.#resolve(id);
+    await this.#withImap(account, (client) => client.list({ listOnly: true }));
+    let transport;
+    try {
+      transport = await this.#smtpFactory(smtpOptions(account, this.timeout));
+      await transport.verify();
+    } catch (error) {
+      throw failure(error, [account]);
+    } finally {
+      closeQuietly(transport);
+    }
+    return { account: account.id, address: account.address, imap: true, smtp: true };
+  }
+
+  async folders(id = '') {
+    const account = await this.#resolve(id);
+    return this.#withImap(account, async (client) => ({
+      account: account.id,
+      folders: (await client.list({ statusQuery: { messages: true, unseen: true } }))
+        .filter((folder) => !folder.flags?.has?.('\\Noselect'))
+        .map((folder) => ({
+          path: String(folder.path),
+          name: String(folder.name),
+          specialUse: String(folder.specialUse || ''),
+          subscribed: Boolean(folder.subscribed),
+          messages: Number(folder.status?.messages || 0),
+          unseen: Number(folder.status?.unseen || 0),
+        })),
+    }));
+  }
+
+  /** Newest first. `query` and `unreadOnly` run as a server-side SEARCH. */
+  async messages(id = '', { mailbox = 'INBOX', unreadOnly = false, query = '', limit = 50 } = {}) {
+    const bounded = Math.max(1, Math.min(100, Number(limit) || 50));
+    const folder = requiredText(mailbox, 'Le dossier IMAP', 255);
+    const needle = String(query || '').trim().slice(0, 200);
+    const account = await this.#resolve(id);
+    return this.#withImap(account, async (client) => {
+      const empty = { account: account.id, mailbox: folder, messages: [] };
+      const lock = await client.getMailboxLock(folder, { readOnly: true, acquireTimeout: this.timeout });
+      try {
+        let range;
+        if (needle || unreadOnly) {
+          const search = {
+            ...(unreadOnly ? { seen: false } : {}),
+            ...(needle ? { or: [{ subject: needle }, { from: needle }, { text: needle }] } : {}),
+          };
+          range = ((await client.search(search, { uid: true })) || []).slice(-bounded);
+          if (!range.length) return empty;
+        } else {
+          const exists = Number(client.mailbox?.exists || 0);
+          if (!exists) return empty;
+          range = `${Math.max(1, exists - bounded + 1)}:*`;
+        }
+        const messages = [];
+        for await (const message of client.fetch(range, {
+          uid: true, envelope: true, flags: true, internalDate: true, size: true,
+        }, { uid: Array.isArray(range) })) {
+          messages.push(envelopeView(message));
+        }
+        messages.sort((a, b) => b.uid - a.uid);
+        return { ...empty, messages };
+      } finally {
+        lock.release();
+      }
+    });
+  }
+
+  /** Raw imapflow metadata and the mailparser result, read with EXAMINE. */
+  async parsedMessage(id, mailbox, uid) {
+    const folder = requiredText(mailbox, 'Le dossier IMAP', 255);
+    const number = Number(uid);
+    if (!Number.isInteger(number) || number < 1) throw new MailError('UID IMAP invalide.');
+    const account = await this.#resolve(id);
+    return this.#withImap(account, async (client) => {
+      const lock = await client.getMailboxLock(folder, { readOnly: true, acquireTimeout: this.timeout });
+      try {
+        const metadata = await client.fetchOne(number, { uid: true, envelope: true, flags: true, size: true }, { uid: true });
+        if (!metadata) throw new MailError(`Message IMAP introuvable : UID ${number}.`);
+        if (Number(metadata.size || 0) > this.maxMessageBytes) {
+          throw new MailError(`Message trop volumineux (${metadata.size} octets, limite ${this.maxMessageBytes}).`);
+        }
+        const raw = await client.fetchOne(number, { source: { maxLength: this.maxMessageBytes + 1 } }, { uid: true });
+        if (!raw || !Buffer.isBuffer(raw.source)) {
+          throw new MailError(`Source du message IMAP indisponible : UID ${number}.`);
+        }
+        if (raw.source.length > this.maxMessageBytes) {
+          throw new MailError(`Message trop volumineux (limite ${this.maxMessageBytes} octets).`);
+        }
+        const parsed = await this.#parser(raw.source, { keepCidLinks: true });
+        return { account: account.id, folder, metadata, parsed };
+      } finally {
+        lock.release();
+      }
+    });
+  }
+
+  /** Parsed message, never marked as seen. Its text is untrusted input. */
+  async message(id = '', mailbox = 'INBOX', uid) {
+    const { account, folder, metadata, parsed } = await this.parsedMessage(id, mailbox, uid);
+    return {
+      ...envelopeView(metadata),
+      account,
+      mailbox: folder,
+      from: parsedAddresses(parsed.from),
+      to: parsedAddresses(parsed.to),
+      cc: parsedAddresses(parsed.cc),
+      replyTo: parsedAddresses(parsed.replyTo),
+      text: String(parsed.text || '').slice(0, MAX_BODY_CHARACTERS),
+      html: typeof parsed.html === 'string' ? parsed.html.slice(0, MAX_BODY_CHARACTERS) : '',
+      attachments: (parsed.attachments || []).map((attachment, index) => ({
+        id: String(index),
+        filename: safeAttachmentName(attachment.filename),
+        contentType: String(attachment.contentType || 'application/octet-stream'),
+        size: Number(attachment.size || attachment.content?.length || 0),
+        contentId: String(attachment.cid || ''),
+        inline: String(attachment.contentDisposition || '').toLowerCase() === 'inline',
+      })),
+      untrustedContent: true,
+    };
+  }
+
+  /** `attachmentId` is the `id` listed by `message()`. */
+  async downloadAttachment(id = '', mailbox = 'INBOX', uid, attachmentId, { maxBytes = MAX_ATTACHMENT_BYTES } = {}) {
+    if (!/^\d{1,4}$/.test(String(attachmentId ?? '').trim())) {
+      throw new MailError('Identifiant de pièce jointe invalide.');
+    }
+    const limit = Math.max(1, Number(maxBytes) || MAX_ATTACHMENT_BYTES);
+    const { account, parsed } = await this.parsedMessage(id, mailbox, uid);
+    const attachment = (parsed.attachments || [])[Number(attachmentId)];
+    if (!attachment || !Buffer.isBuffer(attachment.content)) {
+      throw new MailError('Pièce jointe introuvable dans ce message.');
+    }
+    if (attachment.content.length > limit) {
+      throw new MailError(`Pièce jointe trop volumineuse (${attachment.content.length} octets, limite ${limit}).`);
+    }
+    return {
+      data: attachment.content,
+      filename: safeAttachmentName(attachment.filename),
+      contentType: String(attachment.contentType || 'application/octet-stream'),
+      size: attachment.content.length,
+      account,
+    };
+  }
+
+  /**
+   * Write an attachment to `destinationPath` (a file, or an existing directory
+   * that receives the sanitized remote name). An existing file is kept unless
+   * `overwrite`, which replaces it atomically. Local only: no mailbox write.
+   */
+  async saveAttachment(id, mailbox, uid, attachmentId, destinationPath, { overwrite = false, maxBytes } = {}) {
+    const destination = String(destinationPath || '').trim();
+    if (!destination) throw new MailError('Le chemin de destination est requis.');
+    const attachment = await this.downloadAttachment(id, mailbox, uid, attachmentId, { maxBytes });
+    let target = path.resolve(destination);
+    const existing = await stat(target).catch(() => null);
+    if (existing?.isDirectory() || /[\\/]$/.test(destination)) target = path.join(target, attachment.filename);
+    await mkdir(path.dirname(target), { recursive: true });
+    if (overwrite) {
+      const temporary = path.join(path.dirname(target), `.${path.basename(target)}.${randomUUID()}.part`);
+      await writeFile(temporary, attachment.data, { flag: 'wx', mode: 0o600 });
+      try {
+        await rename(temporary, target);
+      } catch (error) {
+        await rm(temporary, { force: true });
+        throw new MailError(`Impossible de remplacer ${target} : ${error.code || 'erreur'}.`);
+      }
+    } else {
+      try {
+        await writeFile(target, attachment.data, { flag: 'wx', mode: 0o600 });
+      } catch (error) {
+        if (error.code === 'EEXIST') {
+          throw new MailError(`Le fichier ${target} existe déjà. Passe overwrite: true pour le remplacer.`);
+        }
+        throw new MailError(`Impossible d’écrire ${target} : ${error.code || 'erreur'}.`);
+      }
+    }
+    const { data, ...metadata } = attachment;
+    return { ...metadata, path: target };
+  }
+
+  /** IMAP APPEND to Drafts, flagged \Draft: nothing reaches SMTP. */
+  async saveDraft(id = '', input = {}) {
+    this.#assertWrites('imap');
+    return this.#saveDraft(id, input, 'draft');
+  }
+
+  /** SMTP send, then a copy appended once to Sent. */
+  async send(id = '', input = {}) {
+    this.#assertWrites('smtp');
+    return this.#send(id, input, 'send');
+  }
+
+  /** Send a reply in the thread of `uid`, quoting it below the signature. */
+  async reply(id = '', mailbox = 'INBOX', uid, input = {}) {
+    this.#assertWrites('smtp');
+    return this.#send(id, await this.#replyInput(id, mailbox, uid, input), 'reply');
+  }
+
+  /** Same reply, saved as a draft instead of sent. */
+  async replyDraft(id = '', mailbox = 'INBOX', uid, input = {}) {
+    this.#assertWrites('imap');
+    return this.#saveDraft(id, await this.#replyInput(id, mailbox, uid, input), 'reply-draft');
+  }
+
+  #assertWrites(kind) {
+    if (this.#allowWrites) return;
+    throw new MailError(kind === 'smtp'
+      ? 'Envoi SMTP refusé : utilise allowWrites=true.'
+      : 'Écriture IMAP refusée : utilise allowWrites=true.');
+  }
+
+  #domainAllowed(account) {
+    return !this.#allowedDomains.length || this.#allowedDomains.includes(account.address.split('@').pop());
+  }
+
+  async #resolve(id = '') {
+    await this.authorize();
+    if (!this.#accounts.length) {
+      throw new MailError(`Aucune boîte SMTP/IMAP configurée.${this.#configureHint ? ` ${this.#configureHint}` : ''}`);
+    }
+    const wanted = String(id || '').trim().toLowerCase();
+    const found = wanted
+      ? this.#accounts.find((item) => item.id === wanted)
+      : this.#accounts.find((item) => item.default);
+    if (!found) throw new MailError(`Boîte mail inconnue : ${wanted || '(défaut)'}.`);
+    if (!this.#domainAllowed(found)) {
+      throw new MailError(`Adresse hors des domaines autorisés : ${found.address}. Domaines : ${this.#allowedDomains.join(', ')}.`);
+    }
+    return found;
+  }
+
+  async #withImap(account, run) {
+    let client;
+    try {
+      client = await this.#imapFactory(imapOptions(account, this.timeout));
+      await client.connect();
+      return await run(client);
+    } catch (error) {
+      throw failure(error, [account]);
+    } finally {
+      if (client) {
+        try { await client.logout(); } catch { closeQuietly(client); }
+      }
+    }
+  }
+
+  /** Append `raw` to the `target` folder unless its Message-ID is already there. */
+  async #appendOnce(account, target, raw, { messageId, date }) {
+    return this.#withImap(account, async (client) => {
+      const folders = await client.list({ listOnly: true });
+      const found = folders.find((folder) => String(folder.specialUse || '') === target.specialUse)
+        || folders.find((folder) => target.names.test(String(folder.name || folder.path || '').trim()));
+      if (!found) throw new MailError(`Aucun dossier IMAP « ${target.label} » n’a été trouvé.`);
+      const folder = String(found.path || found.name || '');
+      const lock = await client.getMailboxLock(folder, { acquireTimeout: this.timeout });
+      try {
+        const find = async () => (await client.search({ header: { 'message-id': messageId } }, { uid: true })) || [];
+        const existing = await find();
+        if (existing.length) return { mailbox: folder, uid: existing.at(-1), added: false };
+        let appended;
+        try {
+          appended = await client.append(folder, raw, [...target.flags], date);
+        } catch (error) {
+          // The server may have stored the message before the connection failed.
+          const recovered = await find();
+          if (recovered.length) return { mailbox: folder, uid: recovered.at(-1), added: true };
+          throw error;
+        }
+        const verified = appended?.uid ? [appended.uid] : await find();
+        if (!verified.length) {
+          throw new MailError(`Le message reste introuvable dans « ${target.label} » après ajout IMAP.`);
+        }
+        return { mailbox: folder, uid: verified.at(-1), added: true };
+      } finally {
+        lock.release();
+      }
+    });
+  }
+
+  // Counts only: never a subject, a body, an address or a file name.
+  async #record(account, operation, message, outcome) {
+    if (!this.#audit) return;
+    try {
+      await this.#audit(Object.freeze({
+        connector: 'mail',
+        account: account.id,
+        operation,
+        toCount: message.to.length,
+        ccCount: message.cc.length,
+        bccCount: message.bcc.length,
+        attachmentCount: message.attachments.length,
+        outcome,
+      }));
+    } catch {
+      // The write already happened or was refused: a failing journal must not
+      // turn it into an error that invites a second send.
+    }
+  }
+
+  #compose(account, {
+    to = [], cc = [], bcc = [], subject, text = '', html = '', attachments = [],
+    inReplyTo = '', references = [], quote = null,
+  } = {}, { draft = false } = {}) {
+    const recipients = (values, label) => {
+      if (!Array.isArray(values)) throw new MailError(`${label} doit être une liste.`);
+      if (values.length > MAX_RECIPIENTS) throw new MailError(`${label} dépasse ${MAX_RECIPIENTS} destinataires.`);
+      return values.map((value) => email(value, label));
+    };
+    const target = recipients(to, 'Destinataire');
+    // A draft is finished in the mail client: recipients may come later.
+    if (!target.length && !draft) throw new MailError('Au moins un destinataire est requis.');
+    const copies = recipients(cc, 'Copie');
+    const hidden = recipients(bcc, 'Copie cachée');
+    const title = requiredText(subject, 'L’objet du mail', 500);
+    if (!String(text || '') && !String(html || '')) throw new MailError('Le corps du mail est vide.');
+    if (!Array.isArray(attachments) || attachments.length > MAX_ATTACHMENTS) {
+      throw new MailError(`Au maximum ${MAX_ATTACHMENTS} pièces jointes peuvent être envoyées.`);
+    }
+    if (!Array.isArray(references)) throw new MailError('Les références doivent former une liste.');
+    const bodies = composeBodies(account, { text, html, quote }, this.#mark);
+    return {
+      from: { name: account.label, address: account.address },
+      to: target,
+      cc: copies,
+      bcc: hidden,
+      subject: title,
+      text: bodies.text,
+      ...(bodies.html ? { html: bodies.html } : {}),
+      attachments,
+      date: new Date(),
+      messageId: generatedMessageId(account),
+      ...(this.#mark?.header ? { headers: { [this.#mark.header.name]: this.#mark.header.value } } : {}),
+      ...(inReplyTo ? { inReplyTo: String(inReplyTo).slice(0, 1000) } : {}),
+      ...(references.length ? { references: references.map(String).slice(0, 100) } : {}),
+    };
+  }
+
+  async #send(id, input, operation) {
+    const account = await this.#resolve(id);
+    const message = this.#compose(account, input);
+    const audit = (outcome) => this.#record(account, operation, message, outcome);
+    let raw;
+    try {
+      raw = await buildRawMessage(message);
+    } catch (error) {
+      await audit('failed-before-smtp');
+      throw failure(error, [account]);
+    }
+    let result;
+    let transport;
+    try {
+      transport = await this.#smtpFactory(smtpOptions(account, this.timeout));
+      result = await transport.sendMail(message);
+    } catch (error) {
+      await audit('failed');
+      throw failure(error, [account]);
+    } finally {
+      closeQuietly(transport);
+    }
+    // Accepted by SMTP: from here on, nothing may throw, or a caller could
+    // send the same mail twice.
+    let archive = null;
+    let archiveError = '';
+    try {
+      archive = await this.#appendOnce(account, SENT_FOLDER, raw, message);
+    } catch (error) {
+      archiveError = redactError(error, [account]);
+    }
+    await audit(archive ? 'accepted-archived' : 'accepted-unarchived');
+    return {
+      account: account.id,
+      messageId: message.messageId,
+      accepted: Array.isArray(result?.accepted) ? result.accepted.length : message.to.length,
+      rejected: Array.isArray(result?.rejected) ? result.rejected.length : 0,
+      archived: Boolean(archive),
+      archiveMailbox: archive ? archive.mailbox : '',
+      archiveUid: archive ? Number(archive.uid || 0) : 0,
+      ...(archiveError ? { archiveError } : {}),
+    };
+  }
+
+  async #saveDraft(id, input, operation) {
+    const account = await this.#resolve(id);
+    const message = this.#compose(account, input, { draft: true });
+    const audit = (outcome) => this.#record(account, operation, message, outcome);
+    let raw;
+    try {
+      raw = await buildRawMessage(message);
+    } catch (error) {
+      await audit('failed-before-imap');
+      throw failure(error, [account]);
+    }
+    let saved;
+    try {
+      saved = await this.#appendOnce(account, DRAFTS_FOLDER, raw, message);
+    } catch (error) {
+      await audit('failed');
+      throw error;
+    }
+    await audit('draft-saved');
+    return {
+      account: account.id,
+      messageId: message.messageId,
+      mailbox: saved.mailbox,
+      uid: Number(saved.uid || 0),
+      sent: false,
+    };
+  }
+
+  async #replyInput(id, mailbox, uid, input) {
+    const { metadata, parsed } = await this.parsedMessage(id, mailbox, uid);
+    const envelope = metadata.envelope || {};
+    const messageId = String(parsed.messageId || envelope.messageId || '').trim();
+    if (!messageId) throw new MailError('Ce message ne possède pas de Message-ID utilisable pour une réponse.');
+    return {
+      ...input,
+      subject: replySubject(envelope.subject),
+      inReplyTo: messageId,
+      references: [...referenceList(parsed.references), messageId].slice(-100),
+      quote: quotedMessage(metadata, parsed),
+    };
+  }
 }
