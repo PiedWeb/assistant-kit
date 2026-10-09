@@ -7,3 +7,4 @@ export {
   normalizeAccount, normalizeAccounts, parseAccountConfig, publicAccount, redactError, smtpOptions, stringifyAccountConfig,
 } from './mail.js';
 export * from './cli.js';
+export { runAssistant } from './assistant.js';
