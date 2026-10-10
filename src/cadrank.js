@@ -152,8 +152,25 @@ export class CadrankClient {
     return this.getCsv(`searchForUrl/${encodeURIComponent(url)}`);
   }
 
-  async targets(url) {
-    return this.getCsv(`urlTargetedKws/${encodeURIComponent(url)}`);
+  /**
+   * Declared target keywords of a URL. Cadrank answers 400 without an explicit
+   * project; by default, the one that tracks the URL's host.
+   */
+  async targets(url, { projectId } = {}) {
+    const project = projectId ?? await this.projectFor(url);
+    return this.getCsv(`urlTargetedKws/${encodeURIComponent(url)}?projectId=${encodeURIComponent(project)}`);
+  }
+
+  /** The project tracking the host of `url` (scheme and `www.` ignored); refuses to guess between several. */
+  async projectFor(url) {
+    const host = normaliseDomain(url);
+    const ids = [...new Set((await this.crawlsFor(host)).map((crawl) => crawl.projectId).filter(Boolean))];
+    if (ids.length === 1) {
+      return ids[0];
+    }
+    throw new CadrankError(ids.length
+      ? `« ${host} » est suivi par ${ids.length} projets sur l’instance ${this.instance} : ${ids.join(', ')}. Donner projectId.`
+      : `Aucun projet ne suit « ${host} » sur l’instance ${this.instance} : donner projectId.`, { instance: this.instance });
   }
 
   async related(keyword) {

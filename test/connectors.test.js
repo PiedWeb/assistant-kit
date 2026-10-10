@@ -101,6 +101,25 @@ test('flattenCrawls tolerates a startUrl without scheme and malformed entries; t
   assert.equal(toFloat(Number.NaN), 0);
 });
 
+test('targets names the project Cadrank requires: the one tracking the host, or the one given', async () => {
+  const { client, calls } = cadrank({
+    'GET /_api/projects': () => Response.json([
+      { id: 'p1', name: 'Site', crawls: [{ host: 'www.example.com', hashId: 'Abc' }, { host: 'www.example.com', hashId: 'Def' }] },
+      { id: 'p2', name: 'Autre', crawls: [{ host: 'shared.test', hashId: 'Ghi' }] },
+      { id: 'p3', name: 'Troisième', crawls: [{ host: 'shared.test', hashId: 'Jkl' }] },
+    ]),
+    'GET /_api/urlTargetedKws/https://www.example.com/page': () => new Response('keyword,note,url\ntrek,main,x\n'),
+    'GET /_api/urlTargetedKws/https://shared.test/page': () => new Response('keyword,note,url\n'),
+  });
+
+  assert.deepEqual(await client.targets('https://www.example.com/page'), [{ keyword: 'trek', note: 'main', url: 'x' }]);
+  assert.ok(calls.at(-1).url.endsWith(`/urlTargetedKws/${encodeURIComponent('https://www.example.com/page')}?projectId=p1`));
+  await assert.rejects(client.targets('https://shared.test/page'), /suivi par 2 projets .*p2, p3\. Donner projectId/);
+  await client.targets('https://shared.test/page', { projectId: 'p3' });
+  assert.ok(calls.at(-1).url.endsWith('?projectId=p3'));
+  await assert.rejects(client.targets('https://unknown.test/'), /Aucun projet ne suit « unknown\.test »/);
+});
+
 test('Cadrank errors name the instance and the cause; filters reach the path', async () => {
   const { client, calls } = cadrank({
     'GET /_api/projects': () => Response.json([{ id: 1, crawls: [{ host: 'www.example.com', hashId: 'Abc' }] }]),
