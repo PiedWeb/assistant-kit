@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { jsonFlag, listFlag, parseArguments, runCli } from '../src/cli.js';
+import { jsonFlag, listFlag, parseArguments, positiveInteger, requireArguments, requireFlag, runCli } from '../src/cli.js';
 
 function fakeProcess() {
   const fake = new EventEmitter();
@@ -15,6 +15,26 @@ function fakeProcess() {
   fake.exit = (code) => fake.exits.push(code);
   return fake;
 }
+
+test('required positional arguments and valued flags reject incomplete commands', () => {
+  assert.doesNotThrow(() => requireArguments(['host', 'slug'], 2, 'delete <host> <slug>'));
+  assert.throws(() => requireArguments(['host'], 2, 'delete <host> <slug>', 'project'),
+    /Usage : project delete <host> <slug>/);
+  assert.equal(requireFlag({ to: '/new' }, 'to'), '/new');
+  for (const value of [undefined, true, '', false]) {
+    assert.throws(() => requireFlag({ to: value }, 'to'), /Option obligatoire : --to/);
+  }
+});
+
+test('positive integers accept canonical values and apply a default only when absent', () => {
+  assert.equal(positiveInteger('1'), 1);
+  assert.equal(positiveInteger(' 12 '), 12);
+  assert.equal(positiveInteger(12), 12);
+  assert.equal(positiveInteger(undefined, 25), 25);
+  for (const value of [undefined, null, true, '', '0', '-1', '01', '1.5', '1e2', '12x']) {
+    assert.throws(() => positiveInteger(value), /Entier positif attendu/);
+  }
+});
 
 test('parseArguments refuses unknown flags only when the known list is given', () => {
   const argv = ['sync', 'a.md', '--no-publish', '--code=302', '--', '--literal'];
