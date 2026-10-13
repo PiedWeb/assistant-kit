@@ -25,7 +25,7 @@ copie du code.
 
 ```json
 "dependencies": {
-  "@piedweb/assistant-kit": "git+https://github.com/PiedWeb/assistant-kit.git#v0.2.2"
+  "@piedweb/assistant-kit": "git+https://github.com/PiedWeb/assistant-kit.git#v0.3.0"
 }
 ```
 
