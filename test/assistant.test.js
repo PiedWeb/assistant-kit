@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { runAssistant } from '../src/assistant.js';
+import { CockpitClient } from '../src/cockpit.js';
 
 function sink() {
   const chunks = [];
@@ -29,9 +33,10 @@ test('help lists the built-in scopes and the project lines', async () => {
   const { stdout } = await run(['help'], {
     cadrank: { instances: { fr: { baseUrl: 'https://fr.example' }, us: { baseUrl: 'https://us.example' } } },
     createMailClient: () => ({}),
+    createCockpitClient: () => ({}),
     help: '  docs pull | status',
   });
-  for (const scope of ['vault', 'pushword', 'media', 'redirection', 'cadrank', 'mail', 'docs']) {
+  for (const scope of ['vault', 'pushword', 'media', 'redirection', 'cadrank', 'cockpit', 'mail', 'docs']) {
     assert.match(stdout, new RegExp(`\\n  ${scope} `));
   }
   assert.match(stdout, /--instance fr\|us/);
@@ -94,4 +99,69 @@ test('vault set reads the value on stdin, never from the arguments', async () =>
   assert.match(result.stdout, /API_KEY enregistré/);
   assert.deepEqual(saved, [['API_KEY', 'secret']]);
   assert.doesNotMatch(result.stdout, /secret/);
+});
+
+test('Cockpit is opt-in and reads pass the vault without authorizing writes', async () => {
+  assert.match((await run(['cockpit', 'me'])).stderr, /Commande inconnue : cockpit/);
+  const seen = [];
+  const result = await run(['cockpit', 'me'], { createCockpitClient: ({ vault, allowWrites }) => {
+    seen.push({ vaultAvailable: Boolean(vault), allowWrites });
+    return { me: async () => ({ id: 1 }) };
+  } });
+  assert.equal(result.stderr, '');
+  assert.deepEqual(JSON.parse(result.stdout), { id: 1 });
+  assert.deepEqual(seen, [{ vaultAvailable: true, allowWrites: false }]);
+});
+
+test('Cockpit CLI requires --allow-writes and preserves request bodies and download bytes', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'assistant-cockpit-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const bodyFile = path.join(directory, 'body.json');
+  const queryFile = path.join(directory, 'query.json');
+  const outputFile = path.join(directory, 'extension.zip');
+  fs.writeFileSync(bodyFile, JSON.stringify({ firstName: 'Test' }));
+  fs.writeFileSync(queryFile, JSON.stringify({ locale: 'fr', hasUrl: false }));
+  const zip = Buffer.from([0x50, 0x4b, 0, 0xff, 0x80]);
+  const calls = [];
+  let created = 0;
+  const createCockpitClient = ({ allowWrites }) => {
+    created += 1;
+    return new CockpitClient({ baseUrl: 'https://cockpit.example', token: 'test-key', allowWrites,
+      fetchImpl: async (url, init) => {
+        calls.push({ url, init });
+        return url.endsWith('/download') ? new Response(zip) : Response.json({ ok: true });
+      } });
+  };
+  for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+    const denied = await run(['cockpit', 'api', method, '/api/me'], { createCockpitClient });
+    assert.match(denied.stderr, /refusée sans --allow-writes/);
+    assert.equal(denied.exitCode, 1);
+  }
+  assert.equal(created, 0);
+  assert.match((await run(['cockpit', 'api', 'GET', '/api/instagram/add/Creator'], { createCockpitClient })).stderr, /--allow-writes/);
+  assert.equal(calls.length, 0);
+  const write = await run(['cockpit', 'api', 'PATCH', '/api/me', '--body-file', bodyFile, '--allow-writes'], { createCockpitClient });
+  assert.equal(write.stderr, '');
+  assert.deepEqual(JSON.parse(calls[0].init.body), { firstName: 'Test' });
+  await run(['cockpit', 'instagram-search', '--query-file', queryFile], { createCockpitClient });
+  assert.equal(new URL(calls[1].url).searchParams.get('hasUrl'), 'false');
+  const download = await run(['cockpit', 'api', 'GET', '/api/me/extension/download', '--output', outputFile], { createCockpitClient });
+  assert.equal(download.stderr, '');
+  assert.deepEqual(fs.readFileSync(outputFile), zip);
+  assert.equal(fs.statSync(outputFile).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(download.stdout), { file: outputFile, bytes: zip.length });
+  assert.equal((await run(['cockpit', 'api', 'GET', '/api/me/extension/download', '--output', outputFile], { createCockpitClient })).exitCode, 1);
+  assert.deepEqual(fs.readFileSync(outputFile), zip);
+  assert.equal((await run(['cockpit', 'api', 'GET', '/api/me/extension/download', '--output', outputFile, '--overwrite'], { createCockpitClient })).stderr, '');
+});
+
+test('Cockpit CLI reports missing arguments, missing file flags and unknown actions', async () => {
+  const createCockpitClient = () => ({});
+  for (const argv of [['cockpit', 'api', 'GET'], ['cockpit', 'project'], ['cockpit', 'instagram-detail'],
+    ['cockpit', 'youtube-channel'], ['cockpit', 'youtube-video']]) {
+    assert.match((await run(argv, { createCockpitClient })).stderr, /Usage/);
+  }
+  assert.match((await run(['cockpit', 'api', 'GET', '/api/me', '--query-file'], { createCockpitClient })).stderr, /Option obligatoire : --query-file/);
+  assert.match((await run(['cockpit', 'api', 'GET', '/api/me', '--output'], { createCockpitClient })).stderr, /Option obligatoire : --output/);
+  assert.match((await run(['cockpit', 'unknown'], { createCockpitClient })).stderr, /Commande cockpit inconnue/);
 });

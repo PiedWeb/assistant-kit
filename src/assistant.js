@@ -12,7 +12,7 @@ const MAIL_WRITES = Object.freeze(['draft', 'draft-reply', 'send', 'reply']);
 
 /**
  * The `bin/assistant.js` of a content workspace: doctor, vault, pushword,
- * media, redirection, cadrank and mail commands over the library's
+ * media, redirection, cadrank, cockpit and mail commands over the library's
  * connectors. A project passes its configuration and may add scopes
  * (`commands`), add actions to a scope (`actions.pushword[...]`) or doctor
  * lines; a built-in action is replaced by declaring one with the same name.
@@ -23,6 +23,7 @@ const MAIL_WRITES = Object.freeze(['draft', 'draft-reply', 'send', 'reply']);
  *   createWorkspace({ vault, requireToken }): a ContentWorkspace
  *   brand, configureHint: for `vault configure`
  *   cadrank: { instances: { fr: { baseUrl, keyField } }, defaultInstance, userAgent } or null
+ *   createCockpitClient({ vault, allowWrites }) or null
  *   createMailClient({ vault, allowWrites }) or null; mailWriteRule: the
  *     sentence telling who may allow a mailbox write
  *   help: extra help lines; commands: { scope: handler }; actions: { scope: { action: handler } }
@@ -33,6 +34,7 @@ export async function runAssistant(options) {
   const settings = {
     cli: 'node bin/assistant.js',
     cadrank: null,
+    createCockpitClient: null,
     createMailClient: null,
     mailWriteRule: 'à n’ajouter qu’à la demande explicite de l’utilisateur',
     help: '',
@@ -68,6 +70,7 @@ async function dispatch(settings) {
     media: mediaCommand,
     redirection: redirectionCommand,
     ...(settings.cadrank ? { cadrank: cadrankCommand } : {}),
+    ...(settings.createCockpitClient ? { cockpit: cockpitCommand } : {}),
     ...(settings.createMailClient ? { mail: mailCommand } : {}),
     ...settings.commands,
   };
@@ -138,6 +141,15 @@ function helpText(settings) {
       '  mail draft-reply <uid> --text-file <f> [--folder INBOX] --allow-writes',
       '  mail send ...mêmes options que draft... --allow-writes',
       '  mail reply <uid> --text-file <f> [--folder INBOX] --allow-writes');
+  }
+  if (settings.createCockpitClient) {
+    lines.push('',
+      '  cockpit docs | scopes | me | projects | preferences | extension | health',
+      '  cockpit instagram-search | communities | youtube-channels | youtube-videos [--query-file fichier.json]',
+      '  cockpit instagram-detail <pseudo> | youtube-channel <id> | youtube-video <id> | project <uuid>',
+      '  cockpit api <GET|HEAD|OPTIONS|POST|PUT|PATCH|DELETE> </api/chemin> [--body-file fichier] [--query-file fichier.json]',
+      '              [--output fichier] [--overwrite] [--allow-writes]',
+      '  Toute écriture Cockpit, y compris les anciens GET collecteurs, exige --allow-writes.');
   }
   if (settings.help) lines.push('', settings.help.replace(/\n+$/, ''));
   lines.push('', 'Toute mutation de la production et toute écriture dans la boîte exigent une demande explicite.',
@@ -351,6 +363,52 @@ async function cadrankCommand({ settings, vault, action, args, flags, out, usage
   if (!Object.hasOwn(calls, action || '')) throw new Error(`Commande cadrank inconnue : ${action || ''}`);
   if (!['projects', 'crawls'].includes(action)) usage(1, `cadrank ${action} <argument>`);
   return out(await calls[action]());
+}
+
+async function cockpitCommand({ settings, vault, action, args, flags, out, usage }) {
+  const query = flags['query-file'] ? JSON.parse(fs.readFileSync(requireFlag(flags, 'query-file'), 'utf8')) : {};
+  if (!query || typeof query !== 'object' || Array.isArray(query)) throw new Error('--query-file attend un objet JSON.');
+  if (flags.output) {
+    requireFlag(flags, 'output');
+    if (action !== 'api') throw new Error('--output est disponible sur cockpit api.');
+  }
+  const allowWrites = flags['allow-writes'] === true;
+  if (action === 'api') {
+    usage(2, 'cockpit api <MÉTHODE> </api/chemin>');
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(args[0].toUpperCase()) && !allowWrites) {
+      throw new Error('Écriture Cockpit refusée sans --allow-writes.');
+    }
+  }
+  const client = settings.createCockpitClient({ vault, allowWrites });
+  const calls = {
+    docs: () => client.docs(), scopes: () => client.scopes(), me: () => client.me(),
+    projects: () => client.projects(query), preferences: () => client.preferences(),
+    extension: () => client.extension(), health: () => client.likerHealth(query),
+    'instagram-search': () => client.searchInstagram(query), communities: () => client.communities(query),
+    'instagram-detail': () => client.instagramDetail(args[0], query),
+    'youtube-channels': () => client.youtubeChannels(query), 'youtube-videos': () => client.youtubeVideos(query),
+    'youtube-channel': () => client.youtubeChannel(args[0], query), 'youtube-video': () => client.youtubeVideo(args[0], query),
+    project: () => client.project(args[0]).info(),
+    api: () => client.request(args[0], args[1], { query,
+      body: flags['body-file'] ? readBody(requireFlag(flags, 'body-file')) : undefined,
+      ...(flags.output ? { format: 'buffer' } : {}) }),
+  };
+  if (!Object.hasOwn(calls, action || '')) throw new Error(`Commande cockpit inconnue : ${action || ''}`);
+  if (['instagram-detail', 'youtube-channel', 'youtube-video', 'project'].includes(action)) usage(1, `cockpit ${action} <identifiant>`);
+  let result;
+  try {
+    result = await calls[action]();
+  } catch (error) {
+    if (error.code === 'WRITES_DISABLED') throw new Error('Écriture Cockpit refusée sans --allow-writes.');
+    throw error;
+  }
+  if (flags.output) {
+    if (!Buffer.isBuffer(result)) throw new Error('--output est disponible sur cockpit api.');
+    const file = path.resolve(requireFlag(flags, 'output'));
+    fs.writeFileSync(file, result, { flag: flags.overwrite === true ? 'w' : 'wx', mode: 0o600 });
+    return out({ file, bytes: result.length });
+  }
+  return out(result);
 }
 
 async function mailCommand({ settings, vault, action, args, flags, out, usage }) {

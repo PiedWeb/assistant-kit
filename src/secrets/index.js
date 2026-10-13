@@ -5,6 +5,6 @@ export {
 } from './keychain.js';
 export { createVault, sharedKeychainSource } from './vault.js';
 export {
-  PROBE_LABELS, cadrankProbe, davProbe, hasProbe, jsonProbe, mailProbe, probeConnector, pushwordProbe,
+  PROBE_LABELS, cadrankProbe, cockpitProbe, davProbe, hasProbe, jsonProbe, mailProbe, probeConnector, pushwordProbe,
 } from './probes.js';
 export { browserCommand, configureVault, startVaultServer } from './server.js';

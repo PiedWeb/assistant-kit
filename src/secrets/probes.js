@@ -116,6 +116,16 @@ export function cadrankProbe({ baseUrl, keyField = 'CADRANK_API_KEY' }) {
   });
 }
 
+/** Scope catalog is readable by every personal key, even a write-only key. */
+export function cockpitProbe({ baseUrl, tokenField = 'COCKPIT_API_KEY' }) {
+  return jsonProbe({
+    url: (values) => `${(typeof baseUrl === 'function' ? baseUrl(values) : baseUrl).replace(/\/+$/, '')}/api/api-key-scopes`,
+    headers: (values) => ({ Authorization: `Bearer ${values[tokenField]}` }),
+    check: (data) => Array.isArray(data?.scopes) && data.features && typeof data.features === 'object',
+    detail: 'Cockpit a accepté la lecture du catalogue des permissions.',
+  });
+}
+
 /** Depth-0 PROPFIND on a DAV resource (CalDAV, CardDAV, Nextcloud files). */
 export function davProbe({ url, user, password }) {
   return async (values, { fetchImpl, signal }) => {

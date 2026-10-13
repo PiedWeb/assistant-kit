@@ -11,3 +11,4 @@ export {
 } from './mail.js';
 export * from './cli.js';
 export { runAssistant } from './assistant.js';
+export { CockpitClient, CockpitError, CockpitProjectClient } from './cockpit.js';
