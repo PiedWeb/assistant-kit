@@ -4,7 +4,8 @@
  * Accounts use the `{ version: 2, accounts: [...] }` JSON shared with other
  * consumers through the keychain (a bare array is accepted too). Reads open
  * mailboxes with EXAMINE and never change a flag. Nothing is written to a
- * mailbox (draft, send, reply) unless the caller passes `allowWrites: true`.
+ * mailbox (draft, draft update, read state, send, reply) unless the caller
+ * passes `allowWrites: true`.
  *
  * Project specifics plug in through options, never through this file:
  * `authorize` (identity check before the first operation), `audit` (one entry
@@ -27,15 +28,19 @@ const MAX_ATTACHMENTS = 10;
 const MAX_BODY_CHARACTERS = 100000;
 const MASK = '«valeur masquée»';
 // imapflow infers specialUse from folder names too; the patterns only catch the
-// servers it misses. `flags` are set on the copy appended there.
+// servers it misses. `flags` are set on the copy appended there: a draft is
+// left unread, so that what an agent wrote stands out until someone reads it.
 const SENT_FOLDER = Object.freeze({
   specialUse: '\\Sent', label: 'Envoyés', flags: Object.freeze(['\\Seen']),
   names: /^(?:sent|sent items|envoy[eé]s|messages envoy[eé]s)$/i,
 });
 const DRAFTS_FOLDER = Object.freeze({
-  specialUse: '\\Drafts', label: 'Brouillons', flags: Object.freeze(['\\Draft', '\\Seen']),
+  specialUse: '\\Drafts', label: 'Brouillons', flags: Object.freeze(['\\Draft']),
   names: /^(?:drafts?|brouillons?)$/i,
 });
+// What `quotedMessage` writes, found again in a draft this library saved.
+const HISTORY_HTML = '<div class="mail-history">';
+const HISTORY_TEXT = /(?:^|\n)(Le [^\n]* a écrit :\n>[\s\S]*)$/;
 
 /**
  * Only fixed, non-sensitive fields survive from the original error: `code`
@@ -89,6 +94,18 @@ function email(value, label) {
     throw new MailError(`${label} n’est pas une adresse e-mail valide.`);
   }
   return address;
+}
+
+function recipients(values, label) {
+  if (!Array.isArray(values)) throw new MailError(`${label} doit être une liste.`);
+  if (values.length > MAX_RECIPIENTS) throw new MailError(`${label} dépasse ${MAX_RECIPIENTS} destinataires.`);
+  return values.map((value) => email(value, label));
+}
+
+function uidNumber(value) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1) throw new MailError('UID IMAP invalide.');
+  return number;
 }
 
 function optionalHtml(value, label, max = MAX_SIGNATURE_HTML) {
@@ -245,10 +262,60 @@ function quotedMessage(metadata, parsed) {
     .trim().slice(0, MAX_BODY_CHARACTERS);
   return {
     text: `${heading}\n${original.split(/\r?\n/).map((line) => `> ${line}`).join('\n')}`,
-    html: `<div class="mail-history"><p>${escapeHtml(heading)}</p>`
+    html: `${HISTORY_HTML}<p>${escapeHtml(heading)}</p>`
       + '<blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">'
       + `${textToHtml(original)}</blockquote></div>`,
   };
+}
+
+/**
+ * The quoted history of a reply draft saved by this library, as `quotedMessage`
+ * built it, or null. A draft rewritten by a mail client may have lost the
+ * markup: its history is then not found, never guessed.
+ */
+function draftHistory(parsed) {
+  const html = typeof parsed.html === 'string' ? parsed.html : '';
+  const start = html.indexOf(HISTORY_HTML);
+  if (start < 0) return null;
+  const quoted = html.slice(start);
+  const text = String(parsed.text || '').match(HISTORY_TEXT)?.[1] || htmlToPlainText(quoted);
+  return { text: text.trimEnd(), html: quoted };
+}
+
+// An attachment already in a draft, handed back to nodemailer unchanged.
+function keptAttachment(attachment) {
+  const inline = Boolean(attachment.cid) && String(attachment.contentDisposition || '').toLowerCase() === 'inline';
+  return {
+    filename: safeAttachmentName(attachment.filename),
+    content: attachment.content,
+    contentType: String(attachment.contentType || 'application/octet-stream'),
+    contentDisposition: inline ? 'inline' : 'attachment',
+    ...(attachment.cid ? { cid: String(attachment.cid) } : {}),
+  };
+}
+
+/** What a draft update changes, checked before any connection. */
+function draftChanges(changes) {
+  const source = changes && typeof changes === 'object' && !Array.isArray(changes) ? changes : {};
+  const update = {};
+  for (const [field, label] of [['to', 'Destinataire'], ['cc', 'Copie'], ['bcc', 'Copie cachée']]) {
+    if (source[field] !== undefined) update[field] = recipients(source[field], label);
+  }
+  if (source.subject !== undefined) update.subject = requiredText(source.subject, 'L’objet du mail', 500);
+  const text = String(source.text || '');
+  const html = String(source.html || '');
+  update.bodyReplaced = Boolean(text || html);
+  if (update.bodyReplaced) Object.assign(update, { text, html });
+  const attachments = source.attachments ?? [];
+  if (!Array.isArray(attachments) || attachments.length > MAX_ATTACHMENTS) {
+    throw new MailError(`Au maximum ${MAX_ATTACHMENTS} pièces jointes peuvent être ajoutées.`);
+  }
+  update.attachments = attachments;
+  update.wholeBody = source.wholeBody === true;
+  if (!['to', 'cc', 'bcc', 'subject'].some((field) => field in update) && !update.bodyReplaced && !attachments.length) {
+    throw new MailError('Aucune modification demandée pour ce brouillon.');
+  }
+  return update;
 }
 
 function composeBodies(account, { text = '', html = '', quote = null } = {}, mark = null) {
@@ -433,7 +500,7 @@ function closeQuietly(resource) {
  * new MailClient({
  *   configuration,          // shared JSON string, { accounts } object or array
  *   accounts,               // or the account array itself (not both)
- *   allowWrites: false,     // drafts, sends and replies refused unless true
+ *   allowWrites: false,     // drafts, flag changes, sends and replies refused unless true
  *   allowedDomains: [],     // account addresses outside these domains are refused
  *   authorize: async () => {},   // runs once before the first operation, throws to refuse
  *   audit: (entry) => {},        // one entry per write attempt, never any content
@@ -585,26 +652,12 @@ export class MailClient {
   /** Raw imapflow metadata and the mailparser result, read with EXAMINE. */
   async parsedMessage(id, mailbox, uid) {
     const folder = requiredText(mailbox, 'Le dossier IMAP', 255);
-    const number = Number(uid);
-    if (!Number.isInteger(number) || number < 1) throw new MailError('UID IMAP invalide.');
+    const number = uidNumber(uid);
     const account = await this.#resolve(id);
     return this.#withImap(account, async (client) => {
       const lock = await client.getMailboxLock(folder, { readOnly: true, acquireTimeout: this.timeout });
       try {
-        const metadata = await client.fetchOne(number, { uid: true, envelope: true, flags: true, size: true }, { uid: true });
-        if (!metadata) throw new MailError(`Message IMAP introuvable : UID ${number}.`);
-        if (Number(metadata.size || 0) > this.maxMessageBytes) {
-          throw new MailError(`Message trop volumineux (${metadata.size} octets, limite ${this.maxMessageBytes}).`);
-        }
-        const raw = await client.fetchOne(number, { source: { maxLength: this.maxMessageBytes + 1 } }, { uid: true });
-        if (!raw || !Buffer.isBuffer(raw.source)) {
-          throw new MailError(`Source du message IMAP indisponible : UID ${number}.`);
-        }
-        if (raw.source.length > this.maxMessageBytes) {
-          throw new MailError(`Message trop volumineux (limite ${this.maxMessageBytes} octets).`);
-        }
-        const parsed = await this.#parser(raw.source, { keepCidLinks: true });
-        return { account: account.id, folder, metadata, parsed };
+        return { account: account.id, folder, ...await this.#fetchParsed(client, number) };
       } finally {
         lock.release();
       }
@@ -695,7 +748,7 @@ export class MailClient {
     return { ...metadata, path: target };
   }
 
-  /** IMAP APPEND to Drafts, flagged \Draft: nothing reaches SMTP. */
+  /** IMAP APPEND to Drafts, flagged \Draft and left unread: nothing reaches SMTP. */
   async saveDraft(id = '', input = {}) {
     this.#assertWrites('imap');
     return this.#saveDraft(id, input, 'draft');
@@ -717,6 +770,98 @@ export class MailClient {
   async replyDraft(id = '', mailbox = 'INBOX', uid, input = {}) {
     this.#assertWrites('imap');
     return this.#saveDraft(id, await this.#replyInput(id, mailbox, uid, input), 'reply-draft');
+  }
+
+  /**
+   * Rewrite the draft `uid` of `mailbox` (the Drafts folder when empty). IMAP
+   * cannot edit a stored message: the new version is appended to the same
+   * folder, unread, then the old one is deleted. `changes` holds what changes:
+   * `to`, `cc`, `bcc`, `subject` replace their value; `text` or `html` replace
+   * the written part, signature and mark composed again, and keep the quoted
+   * history of a reply; `attachments` are added. A reply draft whose history
+   * cannot be found keeps its body unless `wholeBody: true` replaces it all.
+   */
+  async updateDraft(id = '', mailbox = '', uid, changes = {}) {
+    this.#assertWrites('imap');
+    const number = uidNumber(uid);
+    const folderName = String(mailbox || '').trim() ? requiredText(mailbox, 'Le dossier IMAP', 255) : '';
+    const update = draftChanges(changes);
+    const account = await this.#resolve(id);
+    let message = null;
+    let appending = false;
+    const audit = (outcome) => this.#record(account, 'draft-update', message, outcome);
+    let result;
+    try {
+      result = await this.#withImap(account, async (client) => {
+        const drafts = await this.#findFolder(client, DRAFTS_FOLDER);
+        const folder = folderName || drafts;
+        if (!folder) throw new MailError(`Aucun dossier IMAP « ${DRAFTS_FOLDER.label} » n’a été trouvé.`);
+        const lock = await client.getMailboxLock(folder, { acquireTimeout: this.timeout });
+        try {
+          const { metadata, parsed } = await this.#fetchParsed(client, number);
+          if (!metadata.flags?.has?.('\\Draft') && folder !== drafts) {
+            throw new MailError(`Le message UID ${number} n’est pas un brouillon : seul un brouillon se modifie.`);
+          }
+          const revision = this.#revisedDraft(account, parsed, update);
+          message = revision.message;
+          const raw = await buildRawMessage(message);
+          appending = true;
+          const saved = await this.#appendInLock(client, folder, DRAFTS_FOLDER, raw, message);
+          // The new version is stored: from here on, nothing may throw, or a
+          // caller could save a third copy.
+          const previous = await this.#deleteQuietly(client, account, number);
+          return {
+            account: account.id,
+            messageId: message.messageId,
+            mailbox: folder,
+            uid: Number(saved.uid || 0),
+            sent: false,
+            seen: false,
+            bodyReplaced: update.bodyReplaced,
+            ...(update.bodyReplaced ? { historyKept: revision.historyKept } : {}),
+            previous,
+          };
+        } finally {
+          lock.release();
+        }
+      });
+    } catch (error) {
+      // Nothing was written before the append: the draft is unchanged.
+      await audit(appending ? 'failed' : 'failed-before-append');
+      throw error;
+    }
+    await audit(result.previous.deleted ? 'draft-updated' : 'draft-updated-previous-kept');
+    return result;
+  }
+
+  /** Mark one message as read (`seen: true`) or unread: the only flag a caller sets. */
+  async setSeen(id = '', mailbox = 'INBOX', uid, seen = true) {
+    this.#assertWrites('imap');
+    if (typeof seen !== 'boolean') throw new MailError('L’état lu doit valoir true ou false.');
+    const folder = requiredText(mailbox, 'Le dossier IMAP', 255);
+    const number = uidNumber(uid);
+    const account = await this.#resolve(id);
+    const audit = (outcome) => this.#record(account, seen ? 'mark-read' : 'mark-unread', null, outcome);
+    try {
+      await this.#withImap(account, async (client) => {
+        const lock = await client.getMailboxLock(folder, { acquireTimeout: this.timeout });
+        try {
+          const found = await client.fetchOne(number, { uid: true, flags: true }, { uid: true });
+          if (!found) throw new MailError(`Message IMAP introuvable : UID ${number}.`);
+          const done = seen
+            ? await client.messageFlagsAdd(number, ['\\Seen'], { uid: true })
+            : await client.messageFlagsRemove(number, ['\\Seen'], { uid: true });
+          if (done === false) throw new MailError(`Le serveur IMAP a refusé de changer l’état lu du message UID ${number}.`);
+        } finally {
+          lock.release();
+        }
+      });
+    } catch (error) {
+      await audit('failed');
+      throw error;
+    }
+    await audit(seen ? 'marked-read' : 'marked-unread');
+    return { account: account.id, mailbox: folder, uid: number, seen };
   }
 
   #assertWrites(kind) {
@@ -761,40 +906,86 @@ export class MailClient {
     }
   }
 
+  /** The path of the `target` special folder, or '' when the server has none. */
+  async #findFolder(client, target) {
+    const folders = await client.list({ listOnly: true });
+    const found = folders.find((folder) => String(folder.specialUse || '') === target.specialUse)
+      || folders.find((folder) => target.names.test(String(folder.name || folder.path || '').trim()));
+    return found ? String(found.path || found.name || '') : '';
+  }
+
+  /** Metadata and parsed source of `number`, in the folder the caller has locked. */
+  async #fetchParsed(client, number) {
+    const metadata = await client.fetchOne(number, { uid: true, envelope: true, flags: true, size: true }, { uid: true });
+    if (!metadata) throw new MailError(`Message IMAP introuvable : UID ${number}.`);
+    if (Number(metadata.size || 0) > this.maxMessageBytes) {
+      throw new MailError(`Message trop volumineux (${metadata.size} octets, limite ${this.maxMessageBytes}).`);
+    }
+    const raw = await client.fetchOne(number, { source: { maxLength: this.maxMessageBytes + 1 } }, { uid: true });
+    if (!raw || !Buffer.isBuffer(raw.source)) {
+      throw new MailError(`Source du message IMAP indisponible : UID ${number}.`);
+    }
+    if (raw.source.length > this.maxMessageBytes) {
+      throw new MailError(`Message trop volumineux (limite ${this.maxMessageBytes} octets).`);
+    }
+    return { metadata, parsed: await this.#parser(raw.source, { keepCidLinks: true }) };
+  }
+
   /** Append `raw` to the `target` folder unless its Message-ID is already there. */
-  async #appendOnce(account, target, raw, { messageId, date }) {
+  async #appendOnce(account, target, raw, message) {
     return this.#withImap(account, async (client) => {
-      const folders = await client.list({ listOnly: true });
-      const found = folders.find((folder) => String(folder.specialUse || '') === target.specialUse)
-        || folders.find((folder) => target.names.test(String(folder.name || folder.path || '').trim()));
-      if (!found) throw new MailError(`Aucun dossier IMAP « ${target.label} » n’a été trouvé.`);
-      const folder = String(found.path || found.name || '');
+      const folder = await this.#findFolder(client, target);
+      if (!folder) throw new MailError(`Aucun dossier IMAP « ${target.label} » n’a été trouvé.`);
       const lock = await client.getMailboxLock(folder, { acquireTimeout: this.timeout });
       try {
-        const find = async () => (await client.search({ header: { 'message-id': messageId } }, { uid: true })) || [];
-        const existing = await find();
-        if (existing.length) return { mailbox: folder, uid: existing.at(-1), added: false };
-        let appended;
-        try {
-          appended = await client.append(folder, raw, [...target.flags], date);
-        } catch (error) {
-          // The server may have stored the message before the connection failed.
-          const recovered = await find();
-          if (recovered.length) return { mailbox: folder, uid: recovered.at(-1), added: true };
-          throw error;
-        }
-        const verified = appended?.uid ? [appended.uid] : await find();
-        if (!verified.length) {
-          throw new MailError(`Le message reste introuvable dans « ${target.label} » après ajout IMAP.`);
-        }
-        return { mailbox: folder, uid: verified.at(-1), added: true };
+        return await this.#appendInLock(client, folder, target, raw, message);
       } finally {
         lock.release();
       }
     });
   }
 
-  // Counts only: never a subject, a body, an address or a file name.
+  async #appendInLock(client, folder, target, raw, { messageId, date }) {
+    const find = async () => (await client.search({ header: { 'message-id': messageId } }, { uid: true })) || [];
+    const existing = await find();
+    if (existing.length) return { mailbox: folder, uid: existing.at(-1), added: false };
+    let appended;
+    try {
+      appended = await client.append(folder, raw, [...target.flags], date);
+    } catch (error) {
+      // The server may have stored the message before the connection failed.
+      const recovered = await find();
+      if (recovered.length) return { mailbox: folder, uid: recovered.at(-1), added: true };
+      throw error;
+    }
+    const verified = appended?.uid ? [appended.uid] : await find();
+    if (!verified.length) {
+      throw new MailError(`Le message reste introuvable dans « ${target.label} » après ajout IMAP.`);
+    }
+    return { mailbox: folder, uid: verified.at(-1), added: true };
+  }
+
+  /**
+   * Delete `number` from the locked folder, reporting instead of throwing.
+   * UID EXPUNGE removes that message only. Without UIDPLUS, a plain EXPUNGE
+   * would also remove every message flagged \Deleted by someone else: the
+   * message is then only flagged, and the mail client expunges it later.
+   */
+  async #deleteQuietly(client, account, number) {
+    const expunge = Boolean(client.capabilities?.has?.('UIDPLUS'));
+    try {
+      const done = expunge
+        ? await client.messageDelete(number, { uid: true })
+        : await client.messageFlagsAdd(number, ['\\Deleted'], { uid: true });
+      if (done === false) throw new MailError(`Le serveur IMAP a refusé de supprimer l’ancienne version (UID ${number}).`);
+      return { uid: number, deleted: true, expunged: expunge };
+    } catch (error) {
+      return { uid: number, deleted: false, expunged: false, error: redactError(error, [account]) };
+    }
+  }
+
+  // Counts only: never a subject, a body, an address or a file name. A flag
+  // change has no message to count.
   async #record(account, operation, message, outcome) {
     if (!this.#audit) return;
     try {
@@ -802,10 +993,12 @@ export class MailClient {
         connector: 'mail',
         account: account.id,
         operation,
-        toCount: message.to.length,
-        ccCount: message.cc.length,
-        bccCount: message.bcc.length,
-        attachmentCount: message.attachments.length,
+        ...(message ? {
+          toCount: message.to.length,
+          ccCount: message.cc.length,
+          bccCount: message.bcc.length,
+          attachmentCount: message.attachments.length,
+        } : {}),
         outcome,
       }));
     } catch {
@@ -814,36 +1007,71 @@ export class MailClient {
     }
   }
 
+  /**
+   * The new version of a draft: what `update` leaves undefined comes from the
+   * stored draft, attachments included. A replaced body is composed again, and
+   * an inline image it no longer shows leaves with the old body.
+   */
+  #revisedDraft(account, parsed, update) {
+    const current = (field) => parsedAddresses(parsed[field]).map((entry) => entry.address);
+    const inReplyTo = String(parsed.inReplyTo || '').trim();
+    const references = referenceList(parsed.references);
+    let kept = (parsed.attachments || []).filter((item) => Buffer.isBuffer(item.content)).map(keptAttachment);
+    let bodies;
+    let historyKept = false;
+    if (update.bodyReplaced) {
+      const history = update.wholeBody ? null : draftHistory(parsed);
+      if (!history && !update.wholeBody && (inReplyTo || references.length)) {
+        throw new MailError('Historique cité introuvable dans ce brouillon de réponse (retouché dans un client mail ?) : '
+          + 'rien n’a été modifié. wholeBody: true remplace tout le corps, historique compris.');
+      }
+      historyKept = Boolean(history);
+      bodies = composeBodies(account, { text: update.text, html: update.html, quote: history }, this.#mark);
+      kept = kept.filter((item) => item.contentDisposition !== 'inline' || bodies.html.includes(`cid:${item.cid}`));
+    } else {
+      bodies = { text: String(parsed.text || ''), html: typeof parsed.html === 'string' ? parsed.html : '' };
+    }
+    const message = this.#compose(account, {
+      to: update.to ?? current('to'),
+      cc: update.cc ?? current('cc'),
+      bcc: update.bcc ?? current('bcc'),
+      subject: update.subject ?? parsed.subject,
+      attachments: update.attachments,
+      inReplyTo,
+      references,
+    }, { draft: true, bodies, kept });
+    return { message, historyKept };
+  }
+
+  /**
+   * `bodies` skips the composition (a draft whose body stays as stored);
+   * `kept` are attachments already in that draft, outside the limit on new ones.
+   */
   #compose(account, {
     to = [], cc = [], bcc = [], subject, text = '', html = '', attachments = [],
     inReplyTo = '', references = [], quote = null,
-  } = {}, { draft = false } = {}) {
-    const recipients = (values, label) => {
-      if (!Array.isArray(values)) throw new MailError(`${label} doit être une liste.`);
-      if (values.length > MAX_RECIPIENTS) throw new MailError(`${label} dépasse ${MAX_RECIPIENTS} destinataires.`);
-      return values.map((value) => email(value, label));
-    };
+  } = {}, { draft = false, bodies = null, kept = [] } = {}) {
     const target = recipients(to, 'Destinataire');
     // A draft is finished in the mail client: recipients may come later.
     if (!target.length && !draft) throw new MailError('Au moins un destinataire est requis.');
     const copies = recipients(cc, 'Copie');
     const hidden = recipients(bcc, 'Copie cachée');
     const title = requiredText(subject, 'L’objet du mail', 500);
-    if (!String(text || '') && !String(html || '')) throw new MailError('Le corps du mail est vide.');
+    if (!bodies && !String(text || '') && !String(html || '')) throw new MailError('Le corps du mail est vide.');
     if (!Array.isArray(attachments) || attachments.length > MAX_ATTACHMENTS) {
       throw new MailError(`Au maximum ${MAX_ATTACHMENTS} pièces jointes peuvent être envoyées.`);
     }
     if (!Array.isArray(references)) throw new MailError('Les références doivent former une liste.');
-    const bodies = composeBodies(account, { text, html, quote }, this.#mark);
+    const composed = bodies || composeBodies(account, { text, html, quote }, this.#mark);
     return {
       from: { name: account.label, address: account.address },
       to: target,
       cc: copies,
       bcc: hidden,
       subject: title,
-      text: bodies.text,
-      ...(bodies.html ? { html: bodies.html } : {}),
-      attachments,
+      text: composed.text,
+      ...(composed.html ? { html: composed.html } : {}),
+      attachments: [...kept, ...attachments],
       date: new Date(),
       messageId: generatedMessageId(account),
       ...(this.#mark?.header ? { headers: { [this.#mark.header.name]: this.#mark.header.value } } : {}),

@@ -358,7 +358,7 @@ test('a draft is appended once to Drafts with \\Draft, never through SMTP', asyn
   assert.match(draft.messageId, /^<[0-9a-f-]+@example\.com>$/);
   const [stored] = imap.appended;
   assert.equal(stored.mailbox, 'INBOX.Drafts');
-  assert.deepEqual(stored.flags, ['\\Draft', '\\Seen']);
+  assert.deepEqual(stored.flags, ['\\Draft'], 'left unread, so that it stands out');
   assert.deepEqual(imap.searches.at(-1), { header: { 'message-id': draft.messageId } });
   const saved = await simpleParser(stored.raw);
   assert.equal(saved.messageId, draft.messageId);
@@ -483,6 +483,179 @@ test('a reply keeps the thread and quotes the original in French, below signatur
   });
   await assert.rejects(orphan.client.replyDraft('', 'INBOX', 8, { text: 'Oui' }), /pas de Message-ID utilisable/);
   assert.equal(orphan.imap.appended.length, 0);
+});
+
+/**
+ * A Drafts folder that keeps what is appended: a draft saved by the client can
+ * be read back (real MIME, real parser) and updated. UID 8 stays the original.
+ */
+function draftSetup({ uidplus = true, overrides, ...options } = {}) {
+  const server = imapServer({ overrides: (state) => {
+    state.deletes ||= [];
+    state.flagCalls ||= [];
+    const stored = (uid) => state.appended.find((item) => item.uid === uid && !state.deletes.includes(uid));
+    return {
+      capabilities: new Map(uidplus ? [['UIDPLUS', true]] : []),
+      async fetchOne(uid, query) {
+        const draft = stored(uid);
+        if (draft) return query.source ? { uid, source: draft.raw } : { uid, flags: new Set(draft.flags), size: draft.raw.length, envelope: {} };
+        if (uid !== ORIGINAL.uid) return false;
+        return query.source ? { uid, source: Buffer.from('raw source') } : ORIGINAL;
+      },
+      async messageDelete(range, flags) { state.deletes.push(range); state.flagCalls.push(['delete', range, flags]); return true; },
+      async messageFlagsAdd(range, flags, query) { state.flagCalls.push(['add', range, flags, query]); return true; },
+      async messageFlagsRemove(range, flags, query) { state.flagCalls.push(['remove', range, flags, query]); return true; },
+      ...(typeof overrides === 'function' ? overrides(state) : overrides),
+    };
+  } });
+  const audit = [];
+  const client = new MailClient({
+    configuration: configuration({ signatureHtml: '<p>Agent</p>' }),
+    allowWrites: true,
+    mark: { text: '✦', html: '<p class="mark">✦</p>' },
+    imapFactory: server.factory,
+    smtpFactory: smtpServer().factory,
+    parser: async (source, parserOptions) => (source.toString() === 'raw source' ? parsedOriginal() : simpleParser(source, parserOptions)),
+    audit: (entry) => audit.push(entry),
+    ...options,
+  });
+  const read = async (uid) => simpleParser(server.state.appended.find((item) => item.uid === uid).raw);
+  return { client, imap: server.state, audit, read };
+}
+
+test('a draft update rewrites the written part, keeps signature, mark and history once, and stays unread', async () => {
+  const { client, imap, audit, read } = draftSetup();
+  const first = await client.replyDraft('', 'INBOX', 8, { to: ['alice@example.com'], text: 'Premier jet.' });
+  const updated = await client.updateDraft('', '', first.uid, { text: 'Version **finale**.', cc: ['Copie@Example.org'] });
+
+  assert.deepEqual(updated, {
+    account: 'perso', messageId: updated.messageId, mailbox: 'INBOX.Drafts', uid: 101, sent: false, seen: false,
+    bodyReplaced: true, historyKept: true, previous: { uid: 100, deleted: true, expunged: true },
+  });
+  assert.notEqual(updated.messageId, first.messageId, 'a new version, never mistaken for the old one');
+  const stored = imap.appended.at(-1);
+  assert.deepEqual([stored.mailbox, stored.flags], ['INBOX.Drafts', ['\\Draft']]);
+  assert.deepEqual(imap.flagCalls, [['delete', 100, { uid: true }]]);
+
+  const draft = await read(101);
+  assert.equal(draft.subject, 'Re: Crédit photo');
+  assert.equal(draft.inReplyTo, '<original@example.com>');
+  assert.equal(draft.to.text, 'alice@example.com');
+  assert.equal(draft.cc.text, 'copie@example.org');
+  assert.match(draft.text, /^Version \*\*finale\*\*\.\n\nAgent\n\n✦\n\nLe 17 [^\n]* a écrit :\n> Premier message\n> Suite/);
+  assert.doesNotMatch(draft.text, /Premier jet/);
+  for (const [part, pattern] of [[draft.html, /mail-signature/g], [draft.html, /class="mark"/g], [draft.html, /mail-history/g], [draft.text, /a écrit :/g]]) {
+    assert.equal(part.match(pattern).length, 1, `${pattern} once`);
+  }
+  assert.ok(draft.html.indexOf('Version') < draft.html.indexOf('mail-history'));
+
+  // A second update finds the history the first one kept.
+  const again = await client.updateDraft('', 'INBOX.Drafts', 101, { html: '<p>Troisième</p>' });
+  assert.equal(again.historyKept, true);
+  assert.match((await read(again.uid)).text, /^Troisième\n\nAgent\n\n✦\n\nLe 17 /);
+  assert.deepEqual(audit.map(({ operation, outcome }) => [operation, outcome]), [
+    ['reply-draft', 'draft-saved'], ['draft-update', 'draft-updated'], ['draft-update', 'draft-updated'],
+  ]);
+  assert.deepEqual(audit[1], {
+    connector: 'mail', account: 'perso', operation: 'draft-update', toCount: 1, ccCount: 1, bccCount: 0,
+    attachmentCount: 0, outcome: 'draft-updated',
+  });
+});
+
+test('a draft update without a new body keeps it byte for byte, and its attachments', async () => {
+  const { client, read } = draftSetup();
+  const first = await client.saveDraft('', {
+    to: ['dest@example.org'], bcc: ['cache@example.org'], subject: 'Devis', text: 'Corps initial',
+    attachments: [{ filename: 'devis.pdf', content: Buffer.from('pdf') }],
+  });
+  const before = await read(first.uid);
+  const updated = await client.updateDraft('', '', first.uid, {
+    subject: 'Devis révisé', attachments: [{ filename: 'annexe.txt', content: 'annexe' }],
+  });
+  assert.equal(updated.bodyReplaced, false);
+  assert.equal('historyKept' in updated, false);
+  const after = await read(updated.uid);
+  assert.equal(after.subject, 'Devis révisé');
+  assert.equal(after.text, before.text);
+  assert.equal(after.html, before.html);
+  assert.equal(after.bcc.text, 'cache@example.org');
+  assert.deepEqual(after.attachments.map((item) => [item.filename, item.content.toString()]), [['devis.pdf', 'pdf'], ['annexe.txt', 'annexe']]);
+});
+
+test('a reply draft whose history was lost keeps its body unless wholeBody replaces it all', async () => {
+  const { client, imap, audit, read } = draftSetup();
+  const first = await client.replyDraft('', 'INBOX', 8, { text: 'Premier jet.' });
+  // Rewritten by a mail client: the library's history markup is gone.
+  const stored = imap.appended.at(-1);
+  stored.raw = Buffer.from(stored.raw.toString().replace(/mail-history/g, 'moz-cite-prefix'));
+  await assert.rejects(client.updateDraft('', '', first.uid, { text: 'Nouveau' }), /Historique cité introuvable[^]*wholeBody: true/);
+  assert.equal(imap.appended.length, 1, 'nothing appended');
+  assert.deepEqual(imap.flagCalls, [], 'nothing deleted');
+  assert.equal(audit.at(-1).outcome, 'failed-before-append');
+
+  const replaced = await client.updateDraft('', '', first.uid, { text: 'Nouveau', wholeBody: true });
+  assert.equal(replaced.historyKept, false);
+  const draft = await read(replaced.uid);
+  assert.equal(draft.text, 'Nouveau\n\nAgent\n\n✦');
+  assert.equal(draft.inReplyTo, '<original@example.com>', 'the thread stays');
+});
+
+test('a draft update refuses what is not a draft, and checks its input before any connection', async () => {
+  const { client, imap } = draftSetup();
+  await assert.rejects(client.updateDraft('', 'INBOX', 8, { subject: 'Détourné' }), /UID 8 n’est pas un brouillon/);
+  assert.equal(imap.appended.length, 0);
+
+  const connections = imap.connections;
+  await assert.rejects(client.updateDraft('', '', 100, {}), /Aucune modification demandée/);
+  await assert.rejects(client.updateDraft('', '', 100, { text: '' }), /Aucune modification demandée/);
+  await assert.rejects(client.updateDraft('', '', 100, { to: ['pas une adresse'] }), /Destinataire n’est pas une adresse/);
+  await assert.rejects(client.updateDraft('', '', 100, { subject: ' ' }), /objet du mail est requis/);
+  await assert.rejects(client.updateDraft('', '', 0, { subject: 'Objet' }), /UID IMAP invalide/);
+  await assert.rejects(client.updateDraft('', '', 100, {
+    attachments: Array.from({ length: 11 }, (_, index) => ({ filename: `${index}.txt`, content: 'x' })),
+  }), /Au maximum 10 pièces jointes/);
+  assert.equal(imap.connections, connections);
+  await assert.rejects(setup().client.updateDraft('', '', 100, { subject: 'Objet' }), /Écriture IMAP refusée/);
+  await assert.rejects(client.updateDraft('', '', 404, { subject: 'Objet' }), /introuvable : UID 404/);
+  const none = draftSetup({ overrides: { async list() { return [{ path: 'INBOX', name: 'INBOX' }]; } } });
+  await assert.rejects(none.client.updateDraft('', '', 100, { subject: 'Objet' }), /Aucun dossier IMAP « Brouillons »/);
+});
+
+test('once the new version is stored, a failed deletion is reported, never thrown', async () => {
+  const flagged = draftSetup({ uidplus: false });
+  const first = await flagged.client.saveDraft('', { subject: 'Objet', text: 'Corps' });
+  const kept = await flagged.client.updateDraft('', '', first.uid, { subject: 'Objet 2' });
+  // Without UIDPLUS, EXPUNGE would remove every \Deleted message: only flagged.
+  assert.deepEqual(kept.previous, { uid: first.uid, deleted: true, expunged: false });
+  assert.deepEqual(flagged.imap.flagCalls, [['add', first.uid, ['\\Deleted'], { uid: true }]]);
+
+  const refused = draftSetup({ overrides: { async messageDelete() { throw new Error(`refus pour ${PASSWORD}`); } } });
+  const draft = await refused.client.saveDraft('', { subject: 'Objet', text: 'Corps' });
+  const result = await refused.client.updateDraft('', '', draft.uid, { subject: 'Objet 2' });
+  assert.equal(result.uid, draft.uid + 1);
+  assert.deepEqual(result.previous, { uid: draft.uid, deleted: false, expunged: false, error: 'refus pour «valeur masquée»' });
+  assert.equal(refused.audit.at(-1).outcome, 'draft-updated-previous-kept');
+});
+
+test('setSeen marks one message read or unread, and nothing else', async () => {
+  const { client, imap, audit } = draftSetup();
+  assert.deepEqual(await client.setSeen('', 'INBOX.Drafts', 8, false), { account: 'perso', mailbox: 'INBOX.Drafts', uid: 8, seen: false });
+  assert.deepEqual(await client.setSeen('', 'INBOX', 8, true), { account: 'perso', mailbox: 'INBOX', uid: 8, seen: true });
+  assert.deepEqual(imap.flagCalls, [['remove', 8, ['\\Seen'], { uid: true }], ['add', 8, ['\\Seen'], { uid: true }]]);
+  assert.ok(imap.locks.every((lock) => !lock.readOnly));
+  assert.deepEqual(audit, [
+    { connector: 'mail', account: 'perso', operation: 'mark-unread', outcome: 'marked-unread' },
+    { connector: 'mail', account: 'perso', operation: 'mark-read', outcome: 'marked-read' },
+  ]);
+
+  await assert.rejects(client.setSeen('', 'INBOX', 404, true), /introuvable : UID 404/);
+  assert.equal(audit.at(-1).outcome, 'failed');
+  await assert.rejects(client.setSeen('', 'INBOX', 8, 'non'), /true ou false/);
+  const declined = draftSetup({ overrides: { async messageFlagsAdd() { return false; } } });
+  await assert.rejects(declined.client.setSeen('', 'INBOX', 8, true), /refusé de changer l’état lu/);
+  const readOnly = setup();
+  await assert.rejects(readOnly.client.setSeen('', 'INBOX', 8, false), /Écriture IMAP refusée/);
+  assert.equal(readOnly.imap.connections, 0);
 });
 
 test('signature and mark: no mark by default, the configured one otherwise', async () => {

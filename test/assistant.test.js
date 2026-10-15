@@ -50,7 +50,10 @@ test('unknown scopes and disabled connectors are refused', async () => {
 test('mail writes need --allow-writes before any client exists', async () => {
   let created = 0;
   const createMailClient = () => { created += 1; return {}; };
-  for (const argv of [['mail', 'draft'], ['mail', 'send'], ['mail', 'reply', '1'], ['mail', 'draft-reply', '1']]) {
+  for (const argv of [
+    ['mail', 'draft'], ['mail', 'send'], ['mail', 'reply', '1'], ['mail', 'draft-reply', '1'],
+    ['mail', 'draft-update', '1', '--subject', 'Objet'], ['mail', 'mark-read', '1', '--unread'],
+  ]) {
     const result = await run(argv, { createMailClient, mailWriteRule: 'sur demande de Robin' });
     assert.equal(result.exitCode, 1);
     assert.match(result.stderr, /--allow-writes, sur demande de Robin/);
@@ -67,6 +70,25 @@ test('mail reads stay read-only and writes get allowWrites', async () => {
   await run(['mail', 'list', '--unread', '--account', 'perso'], { createMailClient });
   await run(['mail', 'draft', '--to', 'a@example.com,b@example.com', '--subject', 'Objet', '--allow-writes'], { createMailClient });
   assert.deepEqual(seen, [['messages', 'perso', true, false], ['draft', '', ['a@example.com', 'b@example.com'], true]]);
+});
+
+test('mail draft-update passes only what changes, mark-read defaults to read', async () => {
+  const seen = [];
+  const createMailClient = ({ allowWrites }) => ({
+    updateDraft: async (...args) => { seen.push(['update', allowWrites, ...args]); return {}; },
+    setSeen: async (...args) => { seen.push(['seen', allowWrites, ...args]); return {}; },
+  });
+  await run(['mail', 'draft-update', '12', '--cc', 'c@example.com', '--subject', 'Nouvel objet', '--allow-writes'], { createMailClient });
+  await run(['mail', 'draft-update', '13', '--folder', 'Brouillons', '--whole-body', '--to', 'a@example.com', '--allow-writes'], { createMailClient });
+  await run(['mail', 'mark-read', '12', '--folder', 'INBOX.Drafts', '--unread', '--allow-writes'], { createMailClient });
+  await run(['mail', 'mark-read', '8', '--allow-writes'], { createMailClient });
+  const body = { text: '', html: '', attachments: [] };
+  assert.deepEqual(seen, [
+    ['update', true, '', '', 12, { cc: ['c@example.com'], subject: 'Nouvel objet', ...body, wholeBody: false }],
+    ['update', true, '', 'Brouillons', 13, { to: ['a@example.com'], ...body, wholeBody: true }],
+    ['seen', true, '', 'INBOX.Drafts', 12, false],
+    ['seen', true, '', 'INBOX', 8, true],
+  ]);
 });
 
 test('a file named on the command line syncs whatever its host, sync-all keeps to the hosts', async () => {

@@ -15,7 +15,7 @@ copie du code.
 | `@piedweb/assistant-kit/secrets` | trousseau système au format du tronc commun Grand Angle, vault (environnement, systemd, sources du projet, trousseau, défaut), formulaire web local, sondes en lecture seule |
 | `@piedweb/assistant-kit/cadrank` | client Cadrank (SERP, mots-clés liés, crawls mémorisés), lancement de crawl audité sur autorisation |
 | `@piedweb/assistant-kit/cockpit` | `CockpitClient`, `CockpitProjectClient` : découverte Instagram/YouTube, tableaux CRM, compte, clés API, extension, monitoring, collecteurs et accès générique à toutes les routes `/api` |
-| `@piedweb/assistant-kit/mail` | `MailClient` IMAP et SMTP : lecture seule par défaut, brouillons, envois et réponses sous `allowWrites` |
+| `@piedweb/assistant-kit/mail` | `MailClient` IMAP et SMTP : lecture seule par défaut ; brouillons (création, modification), état lu, envois et réponses sous `allowWrites` |
 | `@piedweb/assistant-kit/audit` | journal JSONL des écritures, sans contenu ni secret |
 | `@piedweb/assistant-kit/cli` | analyse des arguments, `@fichier` JSON, listes, `runCli` |
 
@@ -130,15 +130,31 @@ import { MailClient } from '@piedweb/assistant-kit/mail';
 const mail = new MailClient({ configuration: smtpImapAccountsJson, allowedDomains: ['example.com'] });
 await mail.messages('', { unreadOnly: true, query: 'devis' }); // lecture seule (EXAMINE)
 const writer = new MailClient({ configuration, allowWrites: true, mark, audit });
-await writer.saveDraft('', { to: ['client@example.org'], subject: 'Devis', text });
+const draft = await writer.saveDraft('', { to: ['client@example.org'], subject: 'Devis', text });
+await writer.updateDraft('', '', draft.uid, { text: 'Version corrigée', cc: ['copie@example.org'] });
+await writer.setSeen('', 'INBOX', 8, false);                    // remettre un message en non lu
 ```
 
 La configuration est le JSON `SMTP_IMAP_ACCOUNTS` du tronc commun (boîtes,
 serveurs, TLS ou STARTTLS, signature HTML par boîte). Les lectures ne modifient
-aucun drapeau. Brouillons, envois et réponses exigent `allowWrites: true` ; un
-envoi est archivé dans « Envoyés » sans doublon. `authorize` (contrôle
+aucun drapeau. Brouillons, modifications de brouillon, état lu, envois et
+réponses exigent `allowWrites: true` ; un envoi est archivé dans « Envoyés »
+sans doublon. Un brouillon est enregistré non lu (`\Draft` sans `\Seen`) : il
+ressort dans la boîte jusqu'à ce que quelqu'un le relise. `authorize` (contrôle
 d'identité), `audit` (journal sans contenu) et `mark` (marque et en-tête des
 messages écrits par un agent) se branchent par options.
+
+IMAP ne modifie pas un message stocké : `updateDraft(id, dossier, uid,
+changements)` ajoute la nouvelle version, non lue, dans le même dossier
+(« Brouillons » si `dossier` est vide), puis supprime l'ancienne par `UID
+EXPUNGE` ; sans `UIDPLUS`, elle n'est que marquée `\Deleted`, car un `EXPUNGE`
+emporterait d'autres messages. `to`, `cc`, `bcc` et `subject` remplacent leur
+valeur, `attachments` s'ajoutent, le reste vient du brouillon. `text` ou `html`
+remplacent la partie rédigée ; signature et marque sont recomposées, et
+l'historique cité d'une réponse est conservé. S'il est introuvable (brouillon
+retouché dans un client mail), rien ne change, sauf `wholeBody: true` qui
+remplace tout le corps. Une suppression qui échoue après l'ajout est rapportée
+dans `previous`, jamais levée.
 
 ## Cockpit
 

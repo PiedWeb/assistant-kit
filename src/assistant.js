@@ -8,7 +8,7 @@ import { pagesFromHookPayload, runSyncHook } from './pushword/hook.js';
 import { probeConnector } from './secrets/probes.js';
 import { configureVault } from './secrets/server.js';
 
-const MAIL_WRITES = Object.freeze(['draft', 'draft-reply', 'send', 'reply']);
+const MAIL_WRITES = Object.freeze(['draft', 'draft-reply', 'draft-update', 'mark-read', 'send', 'reply']);
 
 /**
  * The `bin/assistant.js` of a content workspace: doctor, vault, pushword,
@@ -139,6 +139,8 @@ function helpText(settings) {
       '  mail attachment <uid> <numéro> --to <fichier|dossier> [--overwrite]',
       '  mail draft --to a,b --subject <texte> --text-file <f> [--html-file f] [--cc] [--bcc] [--attach f1,f2] --allow-writes',
       '  mail draft-reply <uid> --text-file <f> [--folder INBOX] --allow-writes',
+      '  mail draft-update <uid> [--folder Brouillons] [--to] [--cc] [--bcc] [--subject] [--text-file f] [--html-file f] [--attach f1,f2] [--whole-body] --allow-writes',
+      '  mail mark-read <uid> [--unread] [--folder INBOX] --allow-writes',
       '  mail send ...mêmes options que draft... --allow-writes',
       '  mail reply <uid> --text-file <f> [--folder INBOX] --allow-writes');
   }
@@ -447,6 +449,14 @@ async function mailCommand({ settings, vault, action, args, flags, out, usage })
     draft: () => client.saveDraft(account, message()),
     send: () => client.send(account, message()),
     'draft-reply': () => client.replyDraft(account, mailbox, uid(), body()),
+    // Only what is given changes; the Drafts folder is found when --folder is absent.
+    'draft-update': () => client.updateDraft(account, flags.folder && flags.folder !== true ? flags.folder : '', uid(), {
+      ...Object.fromEntries(['to', 'cc', 'bcc'].filter((name) => flags[name] !== undefined).map((name) => [name, list(flags[name])])),
+      ...(flags.subject !== undefined ? { subject: requireFlag(flags, 'subject') } : {}),
+      ...body(),
+      wholeBody: flags['whole-body'] === true,
+    }),
+    'mark-read': () => client.setSeen(account, mailbox, uid(), flags.unread !== true),
     reply: () => client.reply(account, mailbox, uid(), body()),
   };
   if (!Object.hasOwn(calls, action || '')) throw new Error(`Commande mail inconnue : ${action || ''}`);
