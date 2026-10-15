@@ -6,7 +6,7 @@ export {
   CadrankClient, CadrankError, CadrankProcessing, NETLINK_FILTER, WRITABLE, encodeKeyword, flattenCrawls, parseCsv, toFloat,
 } from './cadrank.js';
 export {
-  MAX_ACCOUNTS, MAX_ATTACHMENT_BYTES, MAX_MESSAGE_BYTES, MailClient, MailError, htmlToPlainText, imapOptions,
+  MAX_ACCOUNTS, MAX_ATTACHMENT_BYTES, MAX_MESSAGE_BYTES, MailClient, MailError, draftVersion, htmlToPlainText, imapOptions,
   normalizeAccount, normalizeAccounts, parseAccountConfig, publicAccount, redactError, smtpOptions, stringifyAccountConfig,
 } from './mail.js';
 export * from './cli.js';

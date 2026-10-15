@@ -50,7 +50,9 @@ export async function runAssistant(options) {
   try {
     await dispatch(settings);
   } catch (error) {
-    settings.stderr.write(`✗ ${error.message}\n`);
+    // A refused draft update carries the draft as it stands: the next attempt starts from it.
+    const details = error.details ? `\n${JSON.stringify(error.details, null, 2)}` : '';
+    settings.stderr.write(`✗ ${error.message}${details}\n`);
     process.exitCode = process.exitCode || 1;
   }
 }
@@ -139,7 +141,8 @@ function helpText(settings) {
       '  mail attachment <uid> <numéro> --to <fichier|dossier> [--overwrite]',
       '  mail draft --to a,b --subject <texte> --text-file <f> [--html-file f] [--cc] [--bcc] [--attach f1,f2] --allow-writes',
       '  mail draft-reply <uid> --text-file <f> [--folder INBOX] --allow-writes',
-      '  mail draft-update <uid> [--folder Brouillons] [--to] [--cc] [--bcc] [--subject] [--text-file f] [--html-file f] [--attach f1,f2] [--whole-body] --allow-writes',
+      '  mail draft-update <uid> --version <v> [--folder Brouillons] [--to] [--cc] [--bcc] [--subject] [--text-file f] [--html-file f] [--attach f1,f2] [--whole-body] --allow-writes',
+      '                                       version : celle de draft, read ou du refus ; sans elle, le refus donne le texte actuel',
       '  mail mark-read <uid> [--unread] [--folder INBOX] --allow-writes',
       '  mail send ...mêmes options que draft... --allow-writes',
       '  mail reply <uid> --text-file <f> [--folder INBOX] --allow-writes');
@@ -455,6 +458,7 @@ async function mailCommand({ settings, vault, action, args, flags, out, usage })
       ...(flags.subject !== undefined ? { subject: requireFlag(flags, 'subject') } : {}),
       ...body(),
       wholeBody: flags['whole-body'] === true,
+      version: flags.version && flags.version !== true ? flags.version : '',
     }),
     'mark-read': () => client.setSeen(account, mailbox, uid(), flags.unread !== true),
     reply: () => client.reply(account, mailbox, uid(), body()),

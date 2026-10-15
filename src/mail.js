@@ -15,7 +15,7 @@
  * imapflow, nodemailer and mailparser load lazily, inside the methods that
  * need them: importing this module (or the vault probes) never loads them.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -26,6 +26,7 @@ const MAX_SIGNATURE_HTML = 100000;
 const MAX_RECIPIENTS = 50;
 const MAX_ATTACHMENTS = 10;
 const MAX_BODY_CHARACTERS = 100000;
+const MAX_COLLAPSED_TEXT = 200000;
 const MASK = '«valeur masquée»';
 // imapflow infers specialUse from folder names too; the patterns only catch the
 // servers it misses. `flags` are set on the copy appended there: a draft is
@@ -38,9 +39,27 @@ const DRAFTS_FOLDER = Object.freeze({
   specialUse: '\\Drafts', label: 'Brouillons', flags: Object.freeze(['\\Draft']),
   names: /^(?:drafts?|brouillons?)$/i,
 });
-// What `quotedMessage` writes, found again in a draft this library saved.
-const HISTORY_HTML = '<div class="mail-history">';
-const HISTORY_TEXT = /(?:^|\n)(Le [^\n]* a écrit :\n>[\s\S]*)$/;
+// Where a quoted history starts in a draft: `quotedMessage` below, Thunderbird,
+// Roundcube and Apple Mail (`blockquote type="cite"`), Gmail, Outlook.
+const HISTORY_CLASS = 'mail-history';
+const HISTORY_HTML = /class=["']?(?:mail-history|moz-cite-prefix|gmail_quote)\b|<blockquote\b[^>]{0,200}\btype=["']?cite|id=["']?(?:divRplyFwdMsg|appendonsend|mail-editor-reference-message-container)\b/i;
+// In the text part: « Le …, X a écrit : » or « On …, X wrote: » above a `>` line,
+// or an « Original Message » separator. Tested line by line, in linear time.
+const QUOTE_HEADING_END = /(?:a écrit|wrote)[ \u00a0\u202f]?:$/;
+const ORIGINAL_SEPARATOR = /^-{2,} ?(?:Original Message|Message d[’']origine|Message original) ?-{2,}$/;
+
+/** Offset of the quoted history in a text part, or -1. */
+function textHistoryStart(plain) {
+  for (let index = 0; index < plain.length;) {
+    const end = plain.indexOf('\n', index);
+    const stop = end < 0 ? plain.length : end;
+    const line = plain.slice(index, Math.min(stop, index + 600)).trimEnd();
+    if (/^(?:Le|On) /.test(line) && QUOTE_HEADING_END.test(line.slice(-12)) && plain[stop + 1] === '>') return index;
+    if (ORIGINAL_SEPARATOR.test(line)) return index;
+    index = stop + 1;
+  }
+  return -1;
+}
 
 /**
  * Only fixed, non-sensitive fields survive from the original error: `code`
@@ -49,11 +68,13 @@ const HISTORY_TEXT = /(?:^|\n)(Le [^\n]* a écrit :\n>[\s\S]*)$/;
  * `cause`: its message may carry a credential.
  */
 export class MailError extends Error {
-  constructor(message, { code = '', authenticationFailed = false } = {}) {
+  constructor(message, { code = '', authenticationFailed = false, details = null } = {}) {
     super(message);
     this.name = 'MailError';
     if (code) this.code = code;
     if (authenticationFailed) this.authenticationFailed = true;
+    // What a refused draft update gives back: the draft as it now stands.
+    if (details) this.details = details;
   }
 }
 
@@ -218,12 +239,30 @@ function decodeHtmlEntities(value) {
     .replace(/&#x([0-9a-f]+);/gi, (match, code) => codePoint(match, code, 16));
 }
 
+/**
+ * Remote HTML to text: line breaks, list items and block ends kept. Tags are
+ * walked with indexOf, in linear time: a `<[^>]*>` expression rescans the rest
+ * of the input at every unclosed `<`, which a hostile message can repeat.
+ */
 export function htmlToPlainText(value) {
-  return decodeHtmlEntities(String(value || '')
-    .replace(/<\s*br\s*\/?\s*>/gi, '\n')
-    .replace(/<\s*li(?:\s[^>]*)?>/gi, '- ')
-    .replace(/<\s*\/(?:p|div|li|tr|h[1-6])\s*>/gi, '\n')
-    .replace(/<[^>]*>/g, ''))
+  const html = String(value || '');
+  let text = '';
+  let index = 0;
+  while (index < html.length) {
+    const open = html.indexOf('<', index);
+    if (open < 0) break;
+    const close = html.indexOf('>', open);
+    // No `>` left: no tag can follow, the rest is text.
+    if (close < 0) break;
+    text += html.slice(index, open);
+    const tag = /^<\s*(\/?)\s*([a-z][a-z0-9]*)/i.exec(html.slice(open, Math.min(close, open + 40)));
+    const name = tag ? tag[2].toLowerCase() : '';
+    if (tag && !tag[1] && name === 'br') text += '\n';
+    else if (tag && !tag[1] && name === 'li') text += '- ';
+    else if (tag?.[1] && /^(?:p|div|li|tr|h[1-6])$/.test(name)) text += '\n';
+    index = close + 1;
+  }
+  return decodeHtmlEntities(text + html.slice(index))
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
@@ -262,24 +301,92 @@ function quotedMessage(metadata, parsed) {
     .trim().slice(0, MAX_BODY_CHARACTERS);
   return {
     text: `${heading}\n${original.split(/\r?\n/).map((line) => `> ${line}`).join('\n')}`,
-    html: `${HISTORY_HTML}<p>${escapeHtml(heading)}</p>`
+    html: `<div class="${HISTORY_CLASS}"><p>${escapeHtml(heading)}</p>`
       + '<blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">'
       + `${textToHtml(original)}</blockquote></div>`,
   };
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// `value` without a trailing `suffix`, whatever the whitespace between its words.
+// Only the tail is searched: a leading `\s*` would rescan a long blank run.
+function withoutSuffix(value, suffix) {
+  const words = String(suffix || '').trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return value;
+  const cut = Math.max(0, value.length - (suffix.length * 4 + 200));
+  const tail = value.slice(cut).replace(new RegExp(`\\s*${words.map(escapeRegExp).join('\\s+')}\\s*$`), '');
+  return value.slice(0, cut) + tail;
+}
+
 /**
- * The quoted history of a reply draft saved by this library, as `quotedMessage`
- * built it, or null. A draft rewritten by a mail client may have lost the
- * markup: its history is then not found, never guessed.
+ * The version an agent must quote to change a draft: a hash of what it can see
+ * and rewrite. A mail client that edits the draft changes it; a read state, a
+ * flag or a new UID for the same content does not.
  */
-function draftHistory(parsed) {
+export function draftVersion({ subject = '', to = [], cc = [], bcc = [], text = '' } = {}) {
+  const body = String(text);
+  const canonical = JSON.stringify([
+    String(subject).trim(),
+    ...[to, cc, bcc].map((list) => list.map((address) => String(address).trim().toLowerCase())),
+    // Whitespace runs collapse so that a composed draft and its parsed copy agree.
+    // Past 200 000 characters that costs seconds: the text is hashed as is, and
+    // the worst case is one needless « changed » refusal, which gives the version.
+    body.length > MAX_COLLAPSED_TEXT ? body.trim() : body.replace(/\s+/g, ' ').trim(),
+  ]);
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 16);
+}
+
+/**
+ * A draft as an agent rewrites it: `text` is the part above the quoted history,
+ * without the signature and mark this client composes again; `history` is kept
+ * as is by an update. The history is searched in the HTML part when there is
+ * one, else in the text: never guessed across both. `quoted` stays internal.
+ */
+function draftView(parsed, { signatureText = '', markText = '' } = {}) {
   const html = typeof parsed.html === 'string' ? parsed.html : '';
-  const start = html.indexOf(HISTORY_HTML);
-  if (start < 0) return null;
-  const quoted = html.slice(start);
-  const text = String(parsed.text || '').match(HISTORY_TEXT)?.[1] || htmlToPlainText(quoted);
-  return { text: text.trimEnd(), html: quoted };
+  const plain = String(parsed.text || '');
+  const textStart = textHistoryStart(plain);
+  const textQuote = textStart >= 0 ? plain.slice(textStart).trimEnd() : '';
+  const htmlStart = html ? html.search(HISTORY_HTML) : -1;
+  let quoted = null;
+  if (htmlStart >= 0) {
+    // From the opening tag that carries the marker.
+    const tail = html.slice(html.lastIndexOf('<', htmlStart));
+    quoted = { html: tail, text: textQuote || htmlToPlainText(tail).trimEnd() };
+  } else if (!html && textQuote) {
+    quoted = { html: '', text: textQuote };
+  }
+  let written = plain;
+  if (textStart >= 0) written = plain.slice(0, textStart);
+  else if (htmlStart >= 0) written = htmlToPlainText(html.slice(0, htmlStart));
+  else if (!plain && html) written = htmlToPlainText(html);
+  const text = withoutSuffix(withoutSuffix(written.trimEnd(), markText), signatureText).trim();
+  const addresses = (field) => parsedAddresses(parsed[field]).map((entry) => entry.address);
+  const view = { subject: String(parsed.subject || ''), to: addresses('to'), cc: addresses('cc'), bcc: addresses('bcc'), text };
+  return {
+    version: draftVersion(view),
+    ...view,
+    reply: Boolean(String(parsed.inReplyTo || '').trim() || referenceList(parsed.references).length),
+    quoted,
+  };
+}
+
+// What an agent is shown of a draft: never the internal history copy.
+function publicDraft({ version, subject, to, cc, bcc, text, quoted }) {
+  return { version, subject, to, cc, bcc, text, historyFound: Boolean(quoted) };
+}
+
+// A message about to be stored, shaped like the parser's result, so that its
+// version is computed exactly as it will be when the draft is read back.
+function composedAsParsed(message) {
+  const list = (values) => ({ value: values.map((address) => ({ address })) });
+  return {
+    subject: message.subject, to: list(message.to), cc: list(message.cc), bcc: list(message.bcc),
+    text: message.text, html: message.html || '', inReplyTo: message.inReplyTo || '', references: message.references || [],
+  };
 }
 
 // An attachment already in a draft, handed back to nodemailer unchanged.
@@ -312,6 +419,7 @@ function draftChanges(changes) {
   }
   update.attachments = attachments;
   update.wholeBody = source.wholeBody === true;
+  update.version = String(source.version || '').trim();
   if (!['to', 'cc', 'bcc', 'subject'].some((field) => field in update) && !update.bodyReplaced && !attachments.length) {
     throw new MailError('Aucune modification demandée pour ce brouillon.');
   }
@@ -407,7 +515,10 @@ export function redactError(error, accounts = []) {
 
 function failure(error, accounts) {
   const code = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,39}$/.test(error.code) ? error.code : '';
-  return new MailError(redactError(error, accounts), { code, authenticationFailed: error?.authenticationFailed === true });
+  return new MailError(redactError(error, accounts), {
+    code, authenticationFailed: error?.authenticationFailed === true,
+    details: error instanceof MailError ? error.details : null,
+  });
 }
 
 function addressList(entries) {
@@ -664,9 +775,13 @@ export class MailClient {
     });
   }
 
-  /** Parsed message, never marked as seen. Its text is untrusted input. */
+  /**
+   * Parsed message, never marked as seen. Its text is untrusted input. A draft
+   * (\Draft) also carries `draft`: the text to rewrite and its version.
+   */
   async message(id = '', mailbox = 'INBOX', uid) {
     const { account, folder, metadata, parsed } = await this.parsedMessage(id, mailbox, uid);
+    const isDraft = Boolean(metadata.flags?.has?.('\\Draft'));
     return {
       ...envelopeView(metadata),
       account,
@@ -685,6 +800,7 @@ export class MailClient {
         contentId: String(attachment.cid || ''),
         inline: String(attachment.contentDisposition || '').toLowerCase() === 'inline',
       })),
+      ...(isDraft ? { draft: publicDraft(this.#draftView(await this.#resolve(account), parsed)) } : {}),
       untrustedContent: true,
     };
   }
@@ -780,6 +896,11 @@ export class MailClient {
    * the written part, signature and mark composed again, and keep the quoted
    * history of a reply; `attachments` are added. A reply draft whose history
    * cannot be found keeps its body unless `wholeBody: true` replaces it all.
+   *
+   * `changes.version` is the draft's version, from its creation, `message()`
+   * or the last update: a missing or outdated one changes nothing, and the
+   * error's `details.current` holds the draft as it now stands, so that the
+   * change is made again on that text and not over someone's edit.
    */
   async updateDraft(id = '', mailbox = '', uid, changes = {}) {
     this.#assertWrites('imap');
@@ -793,20 +914,38 @@ export class MailClient {
     let result;
     try {
       result = await this.#withImap(account, async (client) => {
-        const drafts = await this.#findFolder(client, DRAFTS_FOLDER);
-        const folder = folderName || drafts;
+        // LIST only when needed: no folder named, or a message without \Draft.
+        let drafts = null;
+        const draftsFolder = async () => (drafts ??= await this.#findFolder(client, DRAFTS_FOLDER));
+        const folder = folderName || await draftsFolder();
         if (!folder) throw new MailError(`Aucun dossier IMAP « ${DRAFTS_FOLDER.label} » n’a été trouvé.`);
         const lock = await client.getMailboxLock(folder, { acquireTimeout: this.timeout });
         try {
           const { metadata, parsed } = await this.#fetchParsed(client, number);
-          if (!metadata.flags?.has?.('\\Draft') && folder !== drafts) {
+          if (!metadata.flags?.has?.('\\Draft') && folder !== await draftsFolder()) {
             throw new MailError(`Le message UID ${number} n’est pas un brouillon : seul un brouillon se modifie.`);
           }
-          const revision = this.#revisedDraft(account, parsed, update);
+          const view = this.#draftView(account, parsed);
+          const refuse = (code, reason) => {
+            throw new MailError(`${reason} Rien n’a été modifié : applique la modification au texte actuel `
+              + '(details.current), puis renvoie-la avec sa version.', { code, details: { current: publicDraft(view) } });
+          };
+          if (!update.version) refuse('DRAFT_VERSION_REQUIRED', 'Version du brouillon manquante.');
+          if (update.version !== view.version) {
+            refuse('DRAFT_CHANGED', 'Le brouillon a changé depuis cette version (retouché dans un client mail ?).');
+          }
+          if (update.bodyReplaced && !update.wholeBody && !view.quoted && view.reply) {
+            throw new MailError('Historique cité introuvable dans ce brouillon de réponse : rien n’a été modifié. '
+              + 'wholeBody: true remplace tout le corps, historique compris.', {
+              code: 'DRAFT_HISTORY_NOT_FOUND', details: { current: publicDraft(view) },
+            });
+          }
+          const revision = this.#revisedDraft(account, parsed, view, update);
           message = revision.message;
           const raw = await buildRawMessage(message);
           appending = true;
-          const saved = await this.#appendInLock(client, folder, DRAFTS_FOLDER, raw, message);
+          // A new Message-ID: no need to look for it before the append.
+          const saved = await this.#appendInLock(client, folder, DRAFTS_FOLDER, raw, message, { fresh: true });
           // The new version is stored: from here on, nothing may throw, or a
           // caller could save a third copy.
           const previous = await this.#deleteQuietly(client, account, number);
@@ -815,6 +954,7 @@ export class MailClient {
             messageId: message.messageId,
             mailbox: folder,
             uid: Number(saved.uid || 0),
+            version: this.#draftView(account, composedAsParsed(message)).version,
             sent: false,
             seen: false,
             bodyReplaced: update.bodyReplaced,
@@ -945,9 +1085,9 @@ export class MailClient {
     });
   }
 
-  async #appendInLock(client, folder, target, raw, { messageId, date }) {
+  async #appendInLock(client, folder, target, raw, { messageId, date }, { fresh = false } = {}) {
     const find = async () => (await client.search({ header: { 'message-id': messageId } }, { uid: true })) || [];
-    const existing = await find();
+    const existing = fresh ? [] : await find();
     if (existing.length) return { mailbox: folder, uid: existing.at(-1), added: false };
     let appended;
     try {
@@ -1007,24 +1147,23 @@ export class MailClient {
     }
   }
 
+  #draftView(account, parsed) {
+    return draftView(parsed, { signatureText: htmlToPlainText(account.signatureHtml), markText: this.#mark?.text || '' });
+  }
+
   /**
    * The new version of a draft: what `update` leaves undefined comes from the
    * stored draft, attachments included. A replaced body is composed again, and
    * an inline image it no longer shows leaves with the old body.
    */
-  #revisedDraft(account, parsed, update) {
-    const current = (field) => parsedAddresses(parsed[field]).map((entry) => entry.address);
+  #revisedDraft(account, parsed, view, update) {
     const inReplyTo = String(parsed.inReplyTo || '').trim();
     const references = referenceList(parsed.references);
     let kept = (parsed.attachments || []).filter((item) => Buffer.isBuffer(item.content)).map(keptAttachment);
     let bodies;
     let historyKept = false;
     if (update.bodyReplaced) {
-      const history = update.wholeBody ? null : draftHistory(parsed);
-      if (!history && !update.wholeBody && (inReplyTo || references.length)) {
-        throw new MailError('Historique cité introuvable dans ce brouillon de réponse (retouché dans un client mail ?) : '
-          + 'rien n’a été modifié. wholeBody: true remplace tout le corps, historique compris.');
-      }
+      const history = update.wholeBody ? null : view.quoted;
       historyKept = Boolean(history);
       bodies = composeBodies(account, { text: update.text, html: update.html, quote: history }, this.#mark);
       kept = kept.filter((item) => item.contentDisposition !== 'inline' || bodies.html.includes(`cid:${item.cid}`));
@@ -1032,10 +1171,10 @@ export class MailClient {
       bodies = { text: String(parsed.text || ''), html: typeof parsed.html === 'string' ? parsed.html : '' };
     }
     const message = this.#compose(account, {
-      to: update.to ?? current('to'),
-      cc: update.cc ?? current('cc'),
-      bcc: update.bcc ?? current('bcc'),
-      subject: update.subject ?? parsed.subject,
+      to: update.to ?? view.to,
+      cc: update.cc ?? view.cc,
+      bcc: update.bcc ?? view.bcc,
+      subject: update.subject ?? view.subject,
       attachments: update.attachments,
       inReplyTo,
       references,
@@ -1148,6 +1287,7 @@ export class MailClient {
       messageId: message.messageId,
       mailbox: saved.mailbox,
       uid: Number(saved.uid || 0),
+      version: this.#draftView(account, composedAsParsed(message)).version,
       sent: false,
     };
   }

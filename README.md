@@ -131,7 +131,7 @@ const mail = new MailClient({ configuration: smtpImapAccountsJson, allowedDomain
 await mail.messages('', { unreadOnly: true, query: 'devis' }); // lecture seule (EXAMINE)
 const writer = new MailClient({ configuration, allowWrites: true, mark, audit });
 const draft = await writer.saveDraft('', { to: ['client@example.org'], subject: 'Devis', text });
-await writer.updateDraft('', '', draft.uid, { text: 'Version corrigée', cc: ['copie@example.org'] });
+await writer.updateDraft('', '', draft.uid, { version: draft.version, text: 'Version corrigée', cc: ['copie@example.org'] });
 await writer.setSeen('', 'INBOX', 8, false);                    // remettre un message en non lu
 ```
 
@@ -155,6 +155,18 @@ l'historique cité d'une réponse est conservé. S'il est introuvable (brouillon
 retouché dans un client mail), rien ne change, sauf `wholeBody: true` qui
 remplace tout le corps. Une suppression qui échoue après l'ajout est rapportée
 dans `previous`, jamais levée.
+
+Une modification part toujours du brouillon tel qu'il est : `version` vient de
+sa création, de `message()` (champ `draft` d'un message `\Draft`) ou de la
+modification précédente. C'est l'empreinte de ce qu'un agent voit et réécrit
+(objet, destinataires, texte au-dessus de l'historique, sans signature ni
+marque) : un état lu ne la change pas, une retouche dans un client mail si.
+Sans version (`DRAFT_VERSION_REQUIRED`) ou avec une version dépassée
+(`DRAFT_CHANGED`), rien n'est écrit et `error.details.current` donne le
+brouillon actuel et sa version : la modification se refait sur ce texte, jamais
+par-dessus celle de quelqu'un d'autre. L'historique cité se reconnaît dans le
+format de la librairie et dans ceux de Thunderbird, Roundcube, Apple Mail,
+Gmail et Outlook ; dans le texte, ligne à ligne, en temps linéaire.
 
 ## Cockpit
 

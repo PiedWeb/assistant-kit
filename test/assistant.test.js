@@ -78,17 +78,24 @@ test('mail draft-update passes only what changes, mark-read defaults to read', a
     updateDraft: async (...args) => { seen.push(['update', allowWrites, ...args]); return {}; },
     setSeen: async (...args) => { seen.push(['seen', allowWrites, ...args]); return {}; },
   });
-  await run(['mail', 'draft-update', '12', '--cc', 'c@example.com', '--subject', 'Nouvel objet', '--allow-writes'], { createMailClient });
+  await run(['mail', 'draft-update', '12', '--version', 'abc', '--cc', 'c@example.com', '--subject', 'Nouvel objet', '--allow-writes'], { createMailClient });
   await run(['mail', 'draft-update', '13', '--folder', 'Brouillons', '--whole-body', '--to', 'a@example.com', '--allow-writes'], { createMailClient });
   await run(['mail', 'mark-read', '12', '--folder', 'INBOX.Drafts', '--unread', '--allow-writes'], { createMailClient });
   await run(['mail', 'mark-read', '8', '--allow-writes'], { createMailClient });
   const body = { text: '', html: '', attachments: [] };
   assert.deepEqual(seen, [
-    ['update', true, '', '', 12, { cc: ['c@example.com'], subject: 'Nouvel objet', ...body, wholeBody: false }],
-    ['update', true, '', 'Brouillons', 13, { to: ['a@example.com'], ...body, wholeBody: true }],
+    ['update', true, '', '', 12, { cc: ['c@example.com'], subject: 'Nouvel objet', ...body, wholeBody: false, version: 'abc' }],
+    ['update', true, '', 'Brouillons', 13, { to: ['a@example.com'], ...body, wholeBody: true, version: '' }],
     ['seen', true, '', 'INBOX.Drafts', 12, false],
     ['seen', true, '', 'INBOX', 8, true],
   ]);
+
+  const stale = Object.assign(new Error('Le brouillon a changé.'), { details: { current: { version: 'v2', text: 'Texte actuel' } } });
+  const refused = await run(['mail', 'draft-update', '12', '--subject', 'Objet', '--allow-writes'], {
+    createMailClient: () => ({ updateDraft: async () => { throw stale; } }),
+  });
+  assert.equal(refused.exitCode, 1);
+  assert.match(refused.stderr, /✗ Le brouillon a changé\.\n\{[^]*"version": "v2"[^]*"text": "Texte actuel"/);
 });
 
 test('a file named on the command line syncs whatever its host, sync-all keeps to the hosts', async () => {
