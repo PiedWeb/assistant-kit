@@ -90,6 +90,18 @@ test('mail draft-update passes only what changes, mark-read defaults to read', a
     ['seen', true, '', 'INBOX', 8, true],
   ]);
 
+  const replies = [];
+  const replying = () => ({
+    replyDraft: async (...args) => { replies.push(['draft-reply', ...args]); return {}; },
+    reply: async (...args) => { replies.push(['reply', ...args]); return {}; },
+  });
+  await run(['mail', 'draft-reply', '8', '--allow-writes'], { createMailClient: replying });
+  await run(['mail', 'reply', '8', '--to', 'a@example.com', '--cc', 'c@example.com', '--allow-writes'], { createMailClient: replying });
+  assert.deepEqual(replies, [
+    ['draft-reply', '', 'INBOX', 8, body],
+    ['reply', '', 'INBOX', 8, { to: ['a@example.com'], cc: ['c@example.com'], ...body }],
+  ], 'a reply draft without --to is left to the library, which answers the sender');
+
   const stale = Object.assign(new Error('Le brouillon a changé.'), { details: { current: { version: 'v2', text: 'Texte actuel' } } });
   const refused = await run(['mail', 'draft-update', '12', '--subject', 'Objet', '--allow-writes'], {
     createMailClient: () => ({ updateDraft: async () => { throw stale; } }),

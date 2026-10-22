@@ -140,12 +140,13 @@ function helpText(settings) {
       '  mail read <uid> [--folder INBOX]     lecture seule, rien n’est marqué comme lu',
       '  mail attachment <uid> <numéro> --to <fichier|dossier> [--overwrite]',
       '  mail draft --to a,b --subject <texte> --text-file <f> [--html-file f] [--cc] [--bcc] [--attach f1,f2] --allow-writes',
-      '  mail draft-reply <uid> --text-file <f> [--folder INBOX] --allow-writes',
+      '  mail draft-reply <uid> --text-file <f> [--to a,b] [--cc] [--bcc] [--folder INBOX] --allow-writes',
+      '                                       sans --to : Reply-To du message, sinon son expéditeur',
       '  mail draft-update <uid> --version <v> [--folder Brouillons] [--to] [--cc] [--bcc] [--subject] [--text-file f] [--html-file f] [--attach f1,f2] [--whole-body] --allow-writes',
       '                                       version : celle de draft, read ou du refus ; sans elle, le refus donne le texte actuel',
       '  mail mark-read <uid> [--unread] [--folder INBOX] --allow-writes',
       '  mail send ...mêmes options que draft... --allow-writes',
-      '  mail reply <uid> --text-file <f> [--folder INBOX] --allow-writes');
+      '  mail reply <uid> --to a,b --text-file <f> [--cc] [--bcc] [--folder INBOX] --allow-writes');
   }
   if (settings.createCockpitClient) {
     lines.push('',
@@ -436,6 +437,9 @@ async function mailCommand({ settings, vault, action, args, flags, out, usage })
   const message = () => ({
     to: list(flags.to), cc: list(flags.cc), bcc: list(flags.bcc), subject: requireFlag(flags, 'subject'), ...body(),
   });
+  // Only the recipients given: a draft update keeps the others, a reply draft without --to answers the sender.
+  const given = () => Object.fromEntries(['to', 'cc', 'bcc'].filter((name) => flags[name] !== undefined)
+    .map((name) => [name, list(flags[name])]));
   const calls = {
     verify: () => client.verify(account),
     accounts: () => client.accounts(),
@@ -451,17 +455,17 @@ async function mailCommand({ settings, vault, action, args, flags, out, usage })
     },
     draft: () => client.saveDraft(account, message()),
     send: () => client.send(account, message()),
-    'draft-reply': () => client.replyDraft(account, mailbox, uid(), body()),
+    'draft-reply': () => client.replyDraft(account, mailbox, uid(), { ...given(), ...body() }),
     // Only what is given changes; the Drafts folder is found when --folder is absent.
     'draft-update': () => client.updateDraft(account, flags.folder && flags.folder !== true ? flags.folder : '', uid(), {
-      ...Object.fromEntries(['to', 'cc', 'bcc'].filter((name) => flags[name] !== undefined).map((name) => [name, list(flags[name])])),
+      ...given(),
       ...(flags.subject !== undefined ? { subject: requireFlag(flags, 'subject') } : {}),
       ...body(),
       wholeBody: flags['whole-body'] === true,
       version: flags.version && flags.version !== true ? flags.version : '',
     }),
     'mark-read': () => client.setSeen(account, mailbox, uid(), flags.unread !== true),
-    reply: () => client.reply(account, mailbox, uid(), body()),
+    reply: () => client.reply(account, mailbox, uid(), { ...given(), ...body() }),
   };
   if (!Object.hasOwn(calls, action || '')) throw new Error(`Commande mail inconnue : ${action || ''}`);
   return out(await calls[action]());

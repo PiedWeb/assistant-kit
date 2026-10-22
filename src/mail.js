@@ -277,6 +277,19 @@ function replySubject(value) {
   return /^(?:re|r[eé]|aw)\s*:/i.test(subject) ? subject : `Re: ${subject}`;
 }
 
+/**
+ * Who a reply goes to when the caller names no one: the original's Reply-To,
+ * else its sender. A message the mailbox sent itself goes back to its
+ * recipients. Never the mailbox's own address.
+ */
+function replyRecipients(parsed, self) {
+  const others = (value) => parsedAddresses(value).map((entry) => entry.address).filter((address) => address !== self);
+  const replyTo = others(parsed.replyTo);
+  if (replyTo.length) return replyTo;
+  const sentByUs = parsedAddresses(parsed.from).some((entry) => entry.address === self);
+  return sentByUs ? others(parsed.to) : others(parsed.from);
+}
+
 function referenceList(value) {
   return (Array.isArray(value) ? value : [value])
     .flatMap((entry) => String(entry || '').split(/\s+/))
@@ -876,16 +889,19 @@ export class MailClient {
     return this.#send(id, input, 'send');
   }
 
-  /** Send a reply in the thread of `uid`, quoting it below the signature. */
+  /** Send a reply in the thread of `uid`, quoting it below the signature. `to` is required. */
   async reply(id = '', mailbox = 'INBOX', uid, input = {}) {
     this.#assertWrites('smtp');
     return this.#send(id, await this.#replyInput(id, mailbox, uid, input), 'reply');
   }
 
-  /** Same reply, saved as a draft instead of sent. */
+  /**
+   * Same reply, saved as a draft instead of sent. Without `to` (or with an
+   * empty list), it is addressed as a mail client's "Reply" would be.
+   */
   async replyDraft(id = '', mailbox = 'INBOX', uid, input = {}) {
     this.#assertWrites('imap');
-    return this.#saveDraft(id, await this.#replyInput(id, mailbox, uid, input), 'reply-draft');
+    return this.#saveDraft(id, await this.#replyInput(id, mailbox, uid, input, { draft: true }), 'reply-draft');
   }
 
   /**
@@ -1288,17 +1304,25 @@ export class MailClient {
       mailbox: saved.mailbox,
       uid: Number(saved.uid || 0),
       version: this.#draftView(account, composedAsParsed(message)).version,
+      to: message.to,
       sent: false,
     };
   }
 
-  async #replyInput(id, mailbox, uid, input) {
+  async #replyInput(id, mailbox, uid, input, { draft = false } = {}) {
+    const named = input.to != null && !(Array.isArray(input.to) && !input.to.length);
+    // A send stays explicit: an untrusted Reply-To must not choose the
+    // recipient of a message no one reviewed. A draft is reviewed before it leaves.
+    if (!named && !draft) {
+      throw new MailError('Une réponse envoyée exige son destinataire (to) : seul un brouillon de réponse le reprend du message.');
+    }
     const { metadata, parsed } = await this.parsedMessage(id, mailbox, uid);
     const envelope = metadata.envelope || {};
     const messageId = String(parsed.messageId || envelope.messageId || '').trim();
     if (!messageId) throw new MailError('Ce message ne possède pas de Message-ID utilisable pour une réponse.');
     return {
       ...input,
+      to: named ? input.to : replyRecipients(parsed, (await this.#resolve(id)).address),
       subject: replySubject(envelope.subject),
       inReplyTo: messageId,
       references: [...referenceList(parsed.references), messageId].slice(-100),

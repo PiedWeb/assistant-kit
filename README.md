@@ -132,6 +132,7 @@ await mail.messages('', { unreadOnly: true, query: 'devis' }); // lecture seule 
 const writer = new MailClient({ configuration, allowWrites: true, mark, audit });
 const draft = await writer.saveDraft('', { to: ['client@example.org'], subject: 'Devis', text });
 await writer.updateDraft('', '', draft.uid, { version: draft.version, text: 'Version corrigée', cc: ['copie@example.org'] });
+await writer.replyDraft('', 'INBOX', 8, { text: 'Merci, je regarde.' }); // à l'auteur du message 8
 await writer.setSeen('', 'INBOX', 8, false);                    // remettre un message en non lu
 ```
 
@@ -143,6 +144,15 @@ sans doublon. Un brouillon est enregistré non lu (`\Draft` sans `\Seen`) : il
 ressort dans la boîte jusqu'à ce que quelqu'un le relise. `authorize` (contrôle
 d'identité), `audit` (journal sans contenu) et `mark` (marque et en-tête des
 messages écrits par un agent) se branchent par options.
+
+Une réponse (`reply`, `replyDraft`) reste dans le fil du message cité : objet
+en « Re: », `In-Reply-To`, `References` et historique sous la signature. Un
+brouillon de réponse sans `to` (ou avec une liste vide) s'adresse comme le
+bouton « Répondre » d'un client mail : au `Reply-To` du message, sinon à son
+expéditeur, et à ses destinataires si la boîte l'a elle-même envoyé ; jamais à
+la boîte. Le résultat d'un brouillon donne ses destinataires (`to`). Une
+réponse envoyée, elle, exige `to` : un `Reply-To` venu d'un message non fiable
+ne choisit pas seul le destinataire d'un envoi que personne n'a relu.
 
 IMAP ne modifie pas un message stocké : `updateDraft(id, dossier, uid,
 changements)` ajoute la nouvelle version, non lue, dans le même dossier

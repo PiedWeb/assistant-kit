@@ -356,7 +356,7 @@ test('a draft is appended once to Drafts with \\Draft, never through SMTP', asyn
   const draft = await client.saveDraft('', { bcc: ['Cache@Example.org'], subject: 'Objet', text: 'Corps' });
   assert.equal(smtp.created, 0);
   assert.deepEqual(draft, {
-    account: 'perso', messageId: draft.messageId, mailbox: 'INBOX.Drafts', uid: 100, version: draft.version, sent: false,
+    account: 'perso', messageId: draft.messageId, mailbox: 'INBOX.Drafts', uid: 100, version: draft.version, to: [], sent: false,
   });
   assert.match(draft.version, /^[0-9a-f]{16}$/);
   assert.match(draft.messageId, /^<[0-9a-f-]+@example\.com>$/);
@@ -487,6 +487,35 @@ test('a reply keeps the thread and quotes the original in French, below signatur
   });
   await assert.rejects(orphan.client.replyDraft('', 'INBOX', 8, { text: 'Oui' }), /pas de Message-ID utilisable/);
   assert.equal(orphan.imap.appended.length, 0);
+});
+
+test('a reply draft without recipients answers like a mail client; a sent reply names its own', async () => {
+  const addressed = async (parsed, input = {}) => {
+    const { client, imap, smtp } = setup({ allowWrites: true, parsed });
+    const draft = await client.replyDraft('', 'INBOX', 8, { text: 'Réponse.', ...input });
+    const saved = await simpleParser(imap.appended[0].raw);
+    assert.deepEqual(saved.to?.value.map((entry) => entry.address) || [], draft.to, 'the result says who it is for');
+    assert.equal(smtp.created, 0);
+    return draft.to;
+  };
+  assert.deepEqual(await addressed({}), ['alice@example.com'], 'the sender');
+  assert.deepEqual(await addressed({}, { to: [] }), ['alice@example.com'], 'an empty list, as the MCP default sends it');
+  assert.deepEqual(await addressed({ replyTo: { value: [{ address: 'Contact@Example.org' }] } }), ['contact@example.org'],
+    'Reply-To first, as a website form sets it');
+  assert.deepEqual(await addressed({
+    replyTo: { value: [{ address: 'agent@example.com' }] },
+    from: { value: [{ address: 'AGENT@example.com' }] },
+    to: { value: [{ address: 'alice@example.com' }, { address: 'agent@example.com' }, { address: 'bob@example.org' }] },
+  }), ['alice@example.com', 'bob@example.org'], 'our own message goes back to its recipients, never to ourselves');
+  assert.deepEqual(await addressed({ replyTo: { value: [{ address: 'contact@example.org' }] } }, { to: ['dest@example.org'] }),
+    ['dest@example.org'], 'a named recipient wins');
+
+  // Sending stays explicit: refused before any connection, even with a sender at hand.
+  const { client, imap, smtp } = setup({ allowWrites: true });
+  for (const input of [{ text: 'Oui' }, { to: [], text: 'Oui' }]) {
+    await assert.rejects(client.reply('', 'INBOX', 8, input), /exige son destinataire \(to\)/);
+  }
+  assert.deepEqual([imap.connections, smtp.created], [0, 0]);
 });
 
 /**
