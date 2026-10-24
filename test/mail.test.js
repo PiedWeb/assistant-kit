@@ -465,7 +465,9 @@ test('a reply keeps the thread and quotes the original in French, below signatur
   assert.ok(sent.html.indexOf(mark.html) < sent.html.indexOf('<blockquote'));
   assert.match(sent.html, /<blockquote[^>]*><p>Premier message<\/p><\/blockquote>/);
   assert.doesNotMatch(sent.html, /hostile/);
-  assert.match(sent.text, /^Voici la réponse\.\n\nAgent\n\n✦\n\nLe 17 [^\n]*2026[^\n]*23:35, Alice <alice@example\.com> a écrit :\n> Premier message\n> Suite/);
+  assert.match(sent.text, /^Voici la réponse\.\n\nAgent\n\n✦\n\nLe 2026-09-17 23:35, Alice a écrit\u00a0:\n> Premier message\n> Suite/);
+  // Laid out as Roundcube does: its heading, a cited blockquote with its blue bar.
+  assert.match(sent.html, /<div class="mail-history"><p>Le 2026-09-17 23:35, Alice a écrit\u00a0:<\/p><blockquote type="cite" style="padding:0 0\.4em;border-left:#1010ff 2px solid;margin:0">/);
   assert.ok(imap.locks.filter((lock) => lock.mailbox === 'INBOX').every((lock) => lock.readOnly));
 
   const drafting = setup({ allowWrites: true, parsed: { references: undefined } });
@@ -585,9 +587,9 @@ test('a draft update rewrites the written part, keeps signature, mark and histor
   assert.equal(draft.inReplyTo, '<original@example.com>');
   assert.equal(draft.to.text, 'alice@example.com');
   assert.equal(draft.cc.text, 'copie@example.org');
-  assert.match(draft.text, /^Version \*\*finale\*\*\.\n\nAgent\n\n✦\n\nLe 17 [^\n]* a écrit :\n> Premier message\n> Suite/);
+  assert.match(draft.text, /^Version \*\*finale\*\*\.\n\nAgent\n\n✦\n\nLe 2026-09-17 23:35, Alice a écrit\u00a0:\n> Premier message\n> Suite/);
   assert.doesNotMatch(draft.text, /Premier jet/);
-  for (const [part, pattern] of [[draft.html, /mail-signature/g], [draft.html, /class="mark"/g], [draft.html, /mail-history/g], [draft.text, /a écrit :/g]]) {
+  for (const [part, pattern] of [[draft.html, /mail-signature/g], [draft.html, /class="mark"/g], [draft.html, /mail-history/g], [draft.text, /a écrit\u00a0:/g]]) {
     assert.equal(part.match(pattern).length, 1, `${pattern} once`);
   }
   assert.ok(draft.html.indexOf('Version') < draft.html.indexOf('mail-history'));
@@ -595,7 +597,7 @@ test('a draft update rewrites the written part, keeps signature, mark and histor
   // A second update finds the history the first one kept, and the version it returned.
   const again = await client.updateDraft('', 'INBOX.Drafts', 101, { version: updated.version, html: '<p>Troisième</p>' });
   assert.equal(again.historyKept, true);
-  assert.match((await read(again.uid)).text, /^Troisième\n\nAgent\n\n✦\n\nLe 17 /);
+  assert.match((await read(again.uid)).text, /^Troisième\n\nAgent\n\n✦\n\nLe 2026-09-17 /);
   assert.deepEqual(audit.map(({ operation, outcome }) => [operation, outcome]), [
     ['reply-draft', 'draft-saved'], ['draft-update', 'draft-updated'], ['draft-update', 'draft-updated'],
   ]);
@@ -625,12 +627,67 @@ test('a draft update without a new body keeps it byte for byte, and its attachme
   assert.deepEqual(after.attachments.map((item) => [item.filename, item.content.toString()]), [['devis.pdf', 'pdf'], ['annexe.txt', 'annexe']]);
 });
 
+test('a reply carries the inline images its quote shows, as Roundcube does, and an update keeps them', async () => {
+  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('logo')]);
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from('photo')]);
+  const inline = (cid, content, contentType = 'image/png') => ({
+    cid, content, contentType, contentDisposition: 'inline', filename: `${cid}.img`, size: content.length,
+  });
+  const original = parsedOriginal({
+    html: '<p>Bonjour</p><img src="cid:logo@x" alt="Logo" width="96" style="width:1in;position:absolute">'
+      + '<img src="cid:logo@x"><img src="cid:photo@x"><img src="https://tracker.example/p.gif">'
+      + '<img src="cid:svg@x"><img src="cid:absent@x"><img src="data:image/png;base64,AAAA">',
+    attachments: [
+      inline('logo@x', png),
+      inline('photo@x', jpeg, 'application/octet-stream'),
+      inline('svg@x', Buffer.from('<svg onload="x()"/>'), 'image/png'),
+      { filename: 'devis.pdf', contentType: 'application/pdf', content: Buffer.from('pdf'), size: 3 },
+    ],
+  });
+  const { client, imap } = draftSetup({
+    parser: async (source, options) => (source.toString() === 'raw source' ? original : simpleParser(source, options)),
+  });
+  const read = (uid) => simpleParser(imap.appended.find((item) => item.uid === uid).raw, { keepCidLinks: true });
+  const first = await client.replyDraft('', 'INBOX', 8, { to: ['alice@example.com'], text: 'Premier jet.' });
+  const draft = await read(first.uid);
+  const images = draft.attachments.map((item) => [item.contentType, item.contentDisposition, item.content.toString('latin1')]);
+  assert.deepEqual(images, [['image/png', 'inline', png.toString('latin1')], ['image/jpeg', 'inline', jpeg.toString('latin1')]],
+    'the logo once, the photo by its bytes; no SVG, no unknown image, no PDF of the original');
+  const cids = draft.attachments.map((item) => item.cid);
+  assert.ok(cids.every((cid) => /^[0-9a-f-]{36}@example\.com$/.test(cid)), 'new Content-IDs on the mailbox domain');
+  const [logo, photo] = cids;
+  assert.match(draft.html, new RegExp(`<img src="cid:${logo}" alt="Logo" width="96" style="width:1in"><img src="cid:${logo}"><img src="cid:${photo}">`));
+  assert.doesNotMatch(draft.html, /tracker|svg@x|absent@x|data:image|logo@x/);
+  assert.equal(imap.appended.length, 1);
+
+  const updated = await client.updateDraft('', '', first.uid, { version: first.version, text: 'Version finale.' });
+  assert.equal(updated.historyKept, true);
+  const again = await read(updated.uid);
+  assert.deepEqual(again.attachments.map((item) => item.cid), cids, 'the quote keeps its images');
+  const replaced = await client.updateDraft('', '', updated.uid, { version: updated.version, text: 'Sans historique.', wholeBody: true });
+  assert.deepEqual((await read(replaced.uid)).attachments, [], 'they leave with the history');
+});
+
+test('inline images of a quote are bounded in number and bytes', async () => {
+  const png = (size) => Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(size)]);
+  const many = Array.from({ length: 25 }, (_, index) => ({ cid: `i${index}`, content: png(10), contentType: 'image/png' }));
+  const sent = setup({ allowWrites: true, parsed: { html: many.map((item) => `<img src="cid:${item.cid}">`).join(''), attachments: many } });
+  await sent.client.reply('', 'INBOX', 8, { to: ['alice@example.com'], text: 'Oui' });
+  assert.equal(sent.smtp.sent[0].attachments.length, 20);
+  assert.equal((sent.smtp.sent[0].html.match(/<img /g) || []).length, 20);
+
+  const heavy = [{ cid: 'a', content: png(3 * 1024 * 1024), contentType: 'image/png' }, { cid: 'b', content: png(3 * 1024 * 1024), contentType: 'image/png' }];
+  const bounded = setup({ allowWrites: true, parsed: { html: '<p>x</p><img src="cid:a"><img src="cid:b">', attachments: heavy } });
+  await bounded.client.reply('', 'INBOX', 8, { to: ['alice@example.com'], text: 'Oui' });
+  assert.equal(bounded.smtp.sent[0].attachments.length, 1, '5 MiB in all');
+});
+
 test('a reply draft whose history was lost keeps its body unless wholeBody replaces it all', async () => {
   const { client, imap, audit, read } = draftSetup();
   const first = await client.replyDraft('', 'INBOX', 8, { text: 'Premier jet.' });
   // Rewritten by a mail client into markup no one recognizes; the text is the same.
   const stored = imap.appended.at(-1);
-  stored.raw = Buffer.from(stored.raw.toString().replace(/mail-history/g, 'autre-chose'));
+  stored.raw = Buffer.from(stored.raw.toString().replace(/mail-history|type=(?:3D)?"cite"/g, 'autre-chose'));
   await assert.rejects(client.updateDraft('', '', first.uid, { version: first.version, text: 'Nouveau' }), (error) => {
     assert.equal(error.code, 'DRAFT_HISTORY_NOT_FOUND');
     assert.match(error.message, /Historique cité introuvable[^]*wholeBody: true/);
@@ -935,7 +992,7 @@ test('a quoted message keeps the original layout, rebuilt from an allow-list', a
     + '<span style="color:red">rouge</span>'
     + '<span style="font-family:-apple-system, Segoe UI;padding:4px 0">police</span>'
     + 'Champ'
-    + '<table><tr><td colspan="2">case</td></tr></table>'
+    + '<table width="600"><tr><td colspan="2">case</td></tr></table>'
     + '<blockquote><p>Plus ancien</p></blockquote>'
     + '<p>A &lt;b&gt; reste du texte</p></div>');
 

@@ -275,23 +275,37 @@ function textToHtml(value) {
 
 // What a quoted message keeps of the original HTML (`quotableHtml`). Any other
 // tag is dropped and its content kept, except QUOTE_DROPPED, which goes whole.
+// `img` stays only for an inline image the reply carries along.
 const QUOTE_TAGS = new Set([
   'a', 'b', 'blockquote', 'br', 'code', 'dd', 'del', 'div', 'dl', 'dt', 'em', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
   'hr', 'i', 'ins', 'li', 'ol', 'p', 'pre', 's', 'small', 'span', 'strike', 'strong', 'sub', 'sup',
   'table', 'tbody', 'td', 'tfoot', 'th', 'thead', 'tr', 'u', 'ul',
 ]);
 const QUOTE_DROPPED = new Set([
-  'audio', 'canvas', 'embed', 'head', 'iframe', 'img', 'input', 'map', 'math', 'noscript', 'object',
+  'audio', 'canvas', 'embed', 'head', 'iframe', 'input', 'map', 'math', 'noscript', 'object',
   'picture', 'script', 'select', 'style', 'svg', 'template', 'textarea', 'title', 'video',
 ]);
 const QUOTE_VOID = new Set(['br', 'hr']);
-const QUOTE_STYLES = /^(?:background-color|border(?:-(?:top|right|bottom|left))?(?:-(?:color|style|width))?|border-collapse|color|font-(?:family|size|style|weight)|line-height|margin(?:-(?:top|right|bottom|left))?|padding(?:-(?:top|right|bottom|left))?|text-(?:align|decoration)|vertical-align|white-space)$/;
+const QUOTE_STYLES = /^(?:background-color|border(?:-(?:top|right|bottom|left))?(?:-(?:color|style|width))?|border-collapse|color|font-(?:family|size|style|weight)|height|line-height|margin(?:-(?:top|right|bottom|left))?|padding(?:-(?:top|right|bottom|left))?|text-(?:align|decoration)|vertical-align|white-space|(?:max-)?width)$/;
 const QUOTE_LINK = /^(?:https?:\/\/|mailto:|tel:)[^\0-\x1f\x7f]{0,4000}$/i;
 const QUOTE_HIDDEN = /display\s*:\s*none|visibility\s*:\s*hidden|mso-hide\s*:\s*all/i;
 const MAX_QUOTED_HTML = 1000000;
 // htmlparser2 keeps its open elements in an array it unshifts: past this depth,
 // which no real message reaches, each tag would cost more than the last.
 const MAX_QUOTE_DEPTH = 400;
+// The original's inline images travel with the reply, as Roundcube does;
+// remote images never do (tracking pixels).
+const MAX_QUOTED_IMAGES = 20;
+const MAX_QUOTED_IMAGE_BYTES = 5 * 1024 * 1024;
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+// The type an image's own bytes declare: only PNG, JPEG and GIF travel.
+function imageType(content) {
+  if (content.subarray(0, 8).equals(PNG_SIGNATURE)) return 'image/png';
+  if (content[0] === 0xff && content[1] === 0xd8 && content[2] === 0xff) return 'image/jpeg';
+  if (content.subarray(0, 4).toString('latin1') === 'GIF8') return 'image/gif';
+  return '';
+}
 
 // Allowed properties whose value holds no url(), expression() or comment;
 // only rgb() and hsl() may use parentheses. No negative length either: a
@@ -317,8 +331,12 @@ function quotedAttributes(name, attributes) {
     if (!QUOTE_LINK.test(href)) return null;
     result += ` href="${escapeHtml(href)}"`;
   }
+  if (name === 'img' && attributes.alt) result += ` alt="${escapeHtml(String(attributes.alt).slice(0, 300))}"`;
   for (const key of ['colspan', 'rowspan', 'start']) {
     if (/^\d{1,3}$/.test(attributes[key] || '')) result += ` ${key}="${attributes[key]}"`;
+  }
+  for (const key of ['width', 'height']) {
+    if (/^\d{1,4}%?$/.test(attributes[key] || '')) result += ` ${key}="${attributes[key]}"`;
   }
   const style = quotedStyle(attributes.style);
   if (style) result += ` style="${escapeHtml(style)}"`;
@@ -328,12 +346,13 @@ function quotedAttributes(name, attributes) {
 /**
  * The original HTML as a quote may carry it: parsed, then rebuilt from an
  * allow-list of tags, link schemes and style properties. Scripts, styles,
- * images, form fields and hidden elements go with their content; classes, ids
- * and every other attribute disappear. A message nested deeper than
- * MAX_QUOTE_DEPTH is quoted up to that point. Empty when no text survives.
+ * form fields and hidden elements go with their content; classes, ids and
+ * every other attribute disappear. An image stays only when `inlineImage(src)`
+ * gives it a new source. A message nested deeper than MAX_QUOTE_DEPTH is
+ * quoted up to that point. Empty when neither text nor image survives.
  * `Parser` is htmlparser2's, loaded by the caller.
  */
-export function quotableHtml(value, Parser) {
+export function quotableHtml(value, Parser, inlineImage = () => '') {
   let html = '';
   let visible = false;
   let dropped = 0;
@@ -346,6 +365,15 @@ export function quotableHtml(value, Parser) {
       if (dropped || QUOTE_DROPPED.has(name) || 'hidden' in attributes || QUOTE_HIDDEN.test(attributes.style || '')) {
         dropped += 1;
         open.push('drop');
+        return;
+      }
+      if (name === 'img') {
+        const src = html.length < MAX_BODY_CHARACTERS ? inlineImage(String(attributes.src || '').trim()) : '';
+        if (src) {
+          html += `<img src="${escapeHtml(src)}"${quotedAttributes(name, attributes)}>`;
+          visible = true;
+        }
+        open.push('');
         return;
       }
       const kept = QUOTE_TAGS.has(name) && html.length < MAX_BODY_CHARACTERS ? quotedAttributes(name, attributes) : null;
@@ -402,30 +430,58 @@ function referenceList(value) {
     .filter(Boolean);
 }
 
-async function quotedMessage(metadata, parsed) {
+/**
+ * The quoted history of a reply, laid out as Roundcube does, with the inline
+ * images it shows (`images`, new Content-IDs on `domain`).
+ */
+async function quotedMessage(metadata, parsed, domain) {
   const envelope = metadata.envelope || {};
   const sender = parsedAddresses(parsed.from)[0] || addressList(envelope.from)[0] || {};
-  const senderLabel = sender.name && sender.address
-    ? `${sender.name} <${sender.address}>`
-    : (sender.address || sender.name || 'Expéditeur inconnu');
   const rawDate = parsed.date || envelope.date;
   const date = rawDate ? new Date(rawDate) : null;
-  const dateLabel = date && !Number.isNaN(date.getTime())
-    ? new Intl.DateTimeFormat('fr-FR', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Europe/Paris' }).format(date)
-    : 'date inconnue';
-  const heading = `Le ${dateLabel}, ${senderLabel} a écrit :`;
+  const part = date && !Number.isNaN(date.getTime())
+    ? Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
+      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZone: 'Europe/Paris',
+    }).formatToParts(date).map(({ type, value }) => [type, value]))
+    : null;
+  const dateLabel = part ? `${part.year}-${part.month}-${part.day} ${part.hour}:${part.minute}` : 'date inconnue';
+  const heading = `Le ${dateLabel}, ${sender.name || sender.address || 'Expéditeur inconnu'} a écrit\u00a0:`;
   const original = String(parsed.text || htmlToPlainText(parsed.html || '') || '(message sans contenu textuel)')
     .trim().slice(0, MAX_BODY_CHARACTERS);
+  const inline = new Map((parsed.attachments || [])
+    .filter((attachment) => attachment.cid && Buffer.isBuffer(attachment.content))
+    .map((attachment) => [String(attachment.cid), attachment]));
+  const images = new Map();
+  let bytes = 0;
+  const inlineImage = (src) => {
+    if (!/^cid:/i.test(src)) return '';
+    const cid = src.slice(4);
+    if (!images.has(cid)) {
+      const attachment = inline.get(cid);
+      const contentType = attachment ? imageType(attachment.content) : '';
+      if (!contentType || images.size >= MAX_QUOTED_IMAGES || bytes + attachment.content.length > MAX_QUOTED_IMAGE_BYTES) return '';
+      bytes += attachment.content.length;
+      images.set(cid, {
+        filename: safeAttachmentName(attachment.filename),
+        content: attachment.content,
+        contentType,
+        contentDisposition: 'inline',
+        cid: `${randomUUID()}@${domain}`,
+      });
+    }
+    return `cid:${images.get(cid).cid}`;
+  };
   // The remote HTML is untrusted: it is rebuilt, never copied. The text part
-  // stands in for a message without HTML, or whose HTML keeps no text.
+  // stands in for a message without HTML, or whose HTML keeps nothing.
   const rich = typeof parsed.html === 'string' && parsed.html.trim()
-    ? quotableHtml(parsed.html, (await import('htmlparser2')).Parser)
+    ? quotableHtml(parsed.html, (await import('htmlparser2')).Parser, inlineImage)
     : '';
   return {
     text: `${heading}\n${original.split(/\r?\n/).map((line) => `> ${line}`).join('\n')}`,
     html: `<div class="${HISTORY_CLASS}"><p>${escapeHtml(heading)}</p>`
-      + '<blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">'
+      + '<blockquote type="cite" style="padding:0 0.4em;border-left:#1010ff 2px solid;margin:0">'
       + `${rich || textToHtml(original)}</blockquote></div>`,
+    images: rich ? [...images.values()] : [],
   };
 }
 
@@ -1335,7 +1391,7 @@ export class MailClient {
       subject: title,
       text: composed.text,
       ...(composed.html ? { html: composed.html } : {}),
-      attachments: [...kept, ...attachments],
+      attachments: [...kept, ...(bodies ? [] : quote?.images || []), ...attachments],
       date: new Date(),
       messageId: generatedMessageId(account),
       ...(this.#mark?.header ? { headers: { [this.#mark.header.name]: this.#mark.header.value } } : {}),
@@ -1429,13 +1485,14 @@ export class MailClient {
     const envelope = metadata.envelope || {};
     const messageId = String(parsed.messageId || envelope.messageId || '').trim();
     if (!messageId) throw new MailError('Ce message ne possède pas de Message-ID utilisable pour une réponse.');
+    const { address } = await this.#resolve(id);
     return {
       ...input,
-      to: named ? input.to : replyRecipients(parsed, (await this.#resolve(id)).address),
+      to: named ? input.to : replyRecipients(parsed, address),
       subject: replySubject(envelope.subject),
       inReplyTo: messageId,
       references: [...referenceList(parsed.references), messageId].slice(-100),
-      quote: await quotedMessage(metadata, parsed),
+      quote: await quotedMessage(metadata, parsed, address.split('@').pop()),
     };
   }
 }

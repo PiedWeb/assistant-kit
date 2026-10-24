@@ -147,11 +147,15 @@ messages écrits par un agent) se branchent par options.
 
 Une réponse (`reply`, `replyDraft`) reste dans le fil du message cité : objet
 en « Re: », `In-Reply-To`, `References` et historique sous la signature.
-L'historique garde la mise en forme du message cité : son HTML est reconstruit
-à partir d'une liste blanche (balises de texte, de listes et de tableaux, liens
-`http(s)`, `mailto:` et `tel:`, quelques propriétés de style), sans scripts,
-styles, images, champs de formulaire ni éléments masqués. Un message sans HTML
-est cité depuis sa version texte. Un
+L'historique se présente comme dans Roundcube (« Le 2026-10-22 23:10, Alice a
+écrit : », citation à barre bleue) et garde la mise en forme du message cité :
+son HTML est reconstruit à partir d'une liste blanche (balises de texte, de
+listes et de tableaux, liens `http(s)`, `mailto:` et `tel:`, quelques propriétés
+de style), sans scripts, feuilles de style, champs de formulaire ni éléments
+masqués. Ses images intégrées (`cid:`, PNG, JPEG ou GIF d'après leur contenu)
+repartent avec la réponse, sous un nouveau Content-ID, 20 au plus et 5 Mio en
+tout ; les images distantes, jamais. Une modification du brouillon les garde
+avec l'historique. Un message sans HTML est cité depuis sa version texte. Un
 brouillon de réponse sans `to` (ou avec une liste vide) s'adresse comme le
 bouton « Répondre » d'un client mail : au `Reply-To` du message, sinon à son
 expéditeur, et à ses destinataires si la boîte l'a elle-même envoyé ; jamais à
