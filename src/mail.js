@@ -12,8 +12,9 @@
  * per write, without content), `mark` (agent signature and header),
  * `allowedDomains` (account addresses this project may use).
  *
- * imapflow, nodemailer and mailparser load lazily, inside the methods that
- * need them: importing this module (or the vault probes) never loads them.
+ * imapflow, nodemailer, mailparser and htmlparser2 load lazily, inside the
+ * methods that need them: importing this module (or the vault probes) never
+ * loads them.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, rename, rm, stat, writeFile } from 'node:fs/promises';
@@ -272,6 +273,110 @@ function textToHtml(value) {
   return escapeHtml(value).replace(/\r?\n/g, '<br>');
 }
 
+// What a quoted message keeps of the original HTML (`quotableHtml`). Any other
+// tag is dropped and its content kept, except QUOTE_DROPPED, which goes whole.
+const QUOTE_TAGS = new Set([
+  'a', 'b', 'blockquote', 'br', 'code', 'dd', 'del', 'div', 'dl', 'dt', 'em', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+  'hr', 'i', 'ins', 'li', 'ol', 'p', 'pre', 's', 'small', 'span', 'strike', 'strong', 'sub', 'sup',
+  'table', 'tbody', 'td', 'tfoot', 'th', 'thead', 'tr', 'u', 'ul',
+]);
+const QUOTE_DROPPED = new Set([
+  'audio', 'canvas', 'embed', 'head', 'iframe', 'img', 'input', 'map', 'math', 'noscript', 'object',
+  'picture', 'script', 'select', 'style', 'svg', 'template', 'textarea', 'title', 'video',
+]);
+const QUOTE_VOID = new Set(['br', 'hr']);
+const QUOTE_STYLES = /^(?:background-color|border(?:-(?:top|right|bottom|left))?(?:-(?:color|style|width))?|border-collapse|color|font-(?:family|size|style|weight)|line-height|margin(?:-(?:top|right|bottom|left))?|padding(?:-(?:top|right|bottom|left))?|text-(?:align|decoration)|vertical-align|white-space)$/;
+const QUOTE_LINK = /^(?:https?:\/\/|mailto:|tel:)[^\0-\x1f\x7f]{0,4000}$/i;
+const QUOTE_HIDDEN = /display\s*:\s*none|visibility\s*:\s*hidden|mso-hide\s*:\s*all/i;
+const MAX_QUOTED_HTML = 1000000;
+// htmlparser2 keeps its open elements in an array it unshifts: past this depth,
+// which no real message reaches, each tag would cost more than the last.
+const MAX_QUOTE_DEPTH = 400;
+
+// Allowed properties whose value holds no url(), expression() or comment;
+// only rgb() and hsl() may use parentheses. No negative length either: a
+// negative margin would lift the quote over the reply written above it.
+function quotedStyle(value) {
+  return String(value || '').slice(0, 2000).split(';').map((declaration) => {
+    const colon = declaration.indexOf(':');
+    if (colon < 0) return '';
+    const property = declaration.slice(0, colon).trim().toLowerCase();
+    const raw = declaration.slice(colon + 1).trim();
+    const plain = raw.replace(/\b(?:rgba?|hsla?)\([\d\s.,%]*\)/gi, '');
+    return QUOTE_STYLES.test(property) && raw && raw.length <= 200 && /^[\w\s#%.,'"!+-]*$/.test(plain)
+      && !/(?:^|[^\w-])-[\d.]/.test(plain)
+      ? `${property}:${raw}` : '';
+  }).filter(Boolean).join(';');
+}
+
+// The attributes an allowed tag keeps; null for a link to unwrap.
+function quotedAttributes(name, attributes) {
+  let result = '';
+  if (name === 'a') {
+    const href = String(attributes.href || '').trim();
+    if (!QUOTE_LINK.test(href)) return null;
+    result += ` href="${escapeHtml(href)}"`;
+  }
+  for (const key of ['colspan', 'rowspan', 'start']) {
+    if (/^\d{1,3}$/.test(attributes[key] || '')) result += ` ${key}="${attributes[key]}"`;
+  }
+  const style = quotedStyle(attributes.style);
+  if (style) result += ` style="${escapeHtml(style)}"`;
+  return result;
+}
+
+/**
+ * The original HTML as a quote may carry it: parsed, then rebuilt from an
+ * allow-list of tags, link schemes and style properties. Scripts, styles,
+ * images, form fields and hidden elements go with their content; classes, ids
+ * and every other attribute disappear. A message nested deeper than
+ * MAX_QUOTE_DEPTH is quoted up to that point. Empty when no text survives.
+ * `Parser` is htmlparser2's, loaded by the caller.
+ */
+export function quotableHtml(value, Parser) {
+  let html = '';
+  let visible = false;
+  let dropped = 0;
+  // One entry per open element: what its end writes, or `drop`.
+  const open = [];
+  const tooDeep = new Error('quote too deep');
+  const parser = new Parser({
+    onopentag(name, attributes) {
+      if (open.length >= MAX_QUOTE_DEPTH) throw tooDeep;
+      if (dropped || QUOTE_DROPPED.has(name) || 'hidden' in attributes || QUOTE_HIDDEN.test(attributes.style || '')) {
+        dropped += 1;
+        open.push('drop');
+        return;
+      }
+      const kept = QUOTE_TAGS.has(name) && html.length < MAX_BODY_CHARACTERS ? quotedAttributes(name, attributes) : null;
+      if (kept === null) {
+        open.push('');
+        return;
+      }
+      html += `<${name}${kept}>`;
+      open.push(QUOTE_VOID.has(name) ? '' : `</${name}>`);
+    },
+    onclosetag() {
+      const end = open.pop();
+      if (end === 'drop') dropped -= 1;
+      else if (end) html += end;
+    },
+    ontext(text) {
+      const room = MAX_BODY_CHARACTERS - html.length;
+      if (dropped || room <= 0) return;
+      if (/\S/.test(text)) visible = true;
+      html += escapeHtml(text.length > room ? text.slice(0, room) : text);
+    },
+  }, { decodeEntities: true, lowerCaseTags: true, lowerCaseAttributeNames: true });
+  try {
+    parser.end(String(value || '').slice(0, MAX_QUOTED_HTML));
+  } catch (error) {
+    if (error !== tooDeep) throw error;
+    html += open.reverse().filter((end) => end !== 'drop').join('');
+  }
+  return visible ? html.trim() : '';
+}
+
 function replySubject(value) {
   const subject = String(value || '(sans objet)').trim() || '(sans objet)';
   return /^(?:re|r[eé]|aw)\s*:/i.test(subject) ? subject : `Re: ${subject}`;
@@ -297,7 +402,7 @@ function referenceList(value) {
     .filter(Boolean);
 }
 
-function quotedMessage(metadata, parsed) {
+async function quotedMessage(metadata, parsed) {
   const envelope = metadata.envelope || {};
   const sender = parsedAddresses(parsed.from)[0] || addressList(envelope.from)[0] || {};
   const senderLabel = sender.name && sender.address
@@ -309,14 +414,18 @@ function quotedMessage(metadata, parsed) {
     ? new Intl.DateTimeFormat('fr-FR', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Europe/Paris' }).format(date)
     : 'date inconnue';
   const heading = `Le ${dateLabel}, ${senderLabel} a écrit :`;
-  // Only the text is quoted: the remote HTML is untrusted and never copied.
   const original = String(parsed.text || htmlToPlainText(parsed.html || '') || '(message sans contenu textuel)')
     .trim().slice(0, MAX_BODY_CHARACTERS);
+  // The remote HTML is untrusted: it is rebuilt, never copied. The text part
+  // stands in for a message without HTML, or whose HTML keeps no text.
+  const rich = typeof parsed.html === 'string' && parsed.html.trim()
+    ? quotableHtml(parsed.html, (await import('htmlparser2')).Parser)
+    : '';
   return {
     text: `${heading}\n${original.split(/\r?\n/).map((line) => `> ${line}`).join('\n')}`,
     html: `<div class="${HISTORY_CLASS}"><p>${escapeHtml(heading)}</p>`
       + '<blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">'
-      + `${textToHtml(original)}</blockquote></div>`,
+      + `${rich || textToHtml(original)}</blockquote></div>`,
   };
 }
 
@@ -1326,7 +1435,7 @@ export class MailClient {
       subject: replySubject(envelope.subject),
       inReplyTo: messageId,
       references: [...referenceList(parsed.references), messageId].slice(-100),
-      quote: quotedMessage(metadata, parsed),
+      quote: await quotedMessage(metadata, parsed),
     };
   }
 }

@@ -35,6 +35,7 @@
     "test": "node --test"
   },
   "dependencies": {
+    "htmlparser2": "^10.1.0",
     "imapflow": "^2.0.5",
     "mailparser": "^3.9.28",
     "nodemailer": "^10.0.10",

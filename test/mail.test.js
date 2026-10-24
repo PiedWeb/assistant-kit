@@ -10,7 +10,7 @@ import { inspect } from 'node:util';
 import { simpleParser } from 'mailparser';
 import {
   MAX_ACCOUNTS, MailClient, MailError, htmlToPlainText, imapOptions, normalizeAccount, normalizeAccounts,
-  parseAccountConfig, publicAccount, redactError, smtpOptions, stringifyAccountConfig,
+  parseAccountConfig, publicAccount, quotableHtml, redactError, smtpOptions, stringifyAccountConfig,
 } from '../src/mail.js';
 import { connector, defineCatalog, field, mailProbe, probeConnector } from '../src/secrets/index.js';
 
@@ -463,7 +463,7 @@ test('a reply keeps the thread and quotes the original in French, below signatur
   assert.deepEqual(sent.references, ['<before@example.com>', '<original@example.com>']);
   assert.ok(sent.html.indexOf('mail-signature') < sent.html.indexOf(mark.html));
   assert.ok(sent.html.indexOf(mark.html) < sent.html.indexOf('<blockquote'));
-  assert.match(sent.html, /<blockquote[^>]*>Premier message<br>Suite de la conversation<\/blockquote>/);
+  assert.match(sent.html, /<blockquote[^>]*><p>Premier message<\/p><\/blockquote>/);
   assert.doesNotMatch(sent.html, /hostile/);
   assert.match(sent.text, /^Voici la réponse\.\n\nAgent\n\n✦\n\nLe 17 [^\n]*2026[^\n]*23:35, Alice <alice@example\.com> a écrit :\n> Premier message\n> Suite/);
   assert.ok(imap.locks.filter((lock) => lock.mailbox === 'INBOX').every((lock) => lock.readOnly));
@@ -476,6 +476,13 @@ test('a reply keeps the thread and quotes the original in French, below signatur
   assert.equal(saved.subject, 'Re: Crédit photo');
   assert.equal(saved.inReplyTo, '<original@example.com>');
   assert.equal(saved.references, '<original@example.com>');
+
+  // A message without HTML, or whose HTML keeps no text, is quoted from its text part.
+  for (const html of [false, '<img src="https://example.com/a.png"><style>p{}</style>']) {
+    const textOnly = setup({ allowWrites: true, parsed: { html } });
+    await textOnly.client.reply('', 'INBOX', 8, { to: ['alice@example.com'], text: 'Oui' });
+    assert.match(textOnly.smtp.sent[0].html, /<blockquote[^>]*>Premier message<br>Suite de la conversation<\/blockquote>/);
+  }
 
   const prefixed = setup({ allowWrites: true, imap: { inbox: [{ ...ORIGINAL, envelope: { ...ORIGINAL.envelope, subject: 'RE: Déjà' } }] } });
   await prefixed.client.reply('', 'INBOX', 8, { to: ['alice@example.com'], text: 'Oui' });
@@ -902,12 +909,60 @@ test('htmlToPlainText keeps line breaks, lists and entities', () => {
   assert.equal(htmlToPlainText('<p>Un&nbsp;&amp;&#233;</p><ul><li>a</li><li>b</li></ul>Fin<br>ici'), 'Un &é\n- a\n- b\nFin\nici');
 });
 
+test('a quoted message keeps the original layout, rebuilt from an allow-list', async () => {
+  const { Parser } = await import('htmlparser2');
+  const quoted = quotableHtml(
+    '<html><head><style>p{color:red}</style><title>T</title></head>'
+    + '<body class="x" style="font-family:Aptos"><div class="WordSection1" id="w" onclick="steal()">'
+    + '<p style="margin:0;font-size:11pt;position:fixed;color:rgb(1, 2, 3);background:url(https://t.example/x)">'
+    + 'Bonjour&nbsp;<b>Robin</b>,<o:p></o:p></p>'
+    + '<ul><li>un</li><li><a href="https://example.com/a?b=1&amp;c=2" target="_blank">lien</a></li></ul>'
+    + '<a href="javascript:alert(1)">piège</a> <a href="JaVaScRiPt&#58;alert(1)">bis</a> <a href="cid:logo">cid</a>'
+    + '<span style="display:none">pré-en-tête caché</span><div hidden>caché</div>'
+    + '<span style="color:red;font-size:expression(alert(1));margin-top:-500px;margin:0 -1em">rouge</span>'
+    + '<span style="font-family:-apple-system, Segoe UI;padding:4px 0">police</span>'
+    + '<img src="https://tracker.example/pixel.gif" alt="pixel"><script>steal()</script><iframe src="x">cadre</iframe>'
+    + '<form action="https://evil.example"><input value="v">Champ</form>'
+    + '<table border="1" width="600"><tr><td colspan="2" rowspan="x">case</td></tr></table>'
+    + '<blockquote type="cite"><p>Plus ancien</p></blockquote>'
+    + '<p>A &lt;b&gt; reste du texte</p></div></body></html>',
+    Parser,
+  );
+  assert.equal(quoted,
+    '<div><p style="margin:0;font-size:11pt;color:rgb(1, 2, 3)">Bonjour\u00a0<b>Robin</b>,</p>'
+    + '<ul><li>un</li><li><a href="https://example.com/a?b=1&amp;c=2">lien</a></li></ul>'
+    + 'piège bis cid'
+    + '<span style="color:red">rouge</span>'
+    + '<span style="font-family:-apple-system, Segoe UI;padding:4px 0">police</span>'
+    + 'Champ'
+    + '<table><tr><td colspan="2">case</td></tr></table>'
+    + '<blockquote><p>Plus ancien</p></blockquote>'
+    + '<p>A &lt;b&gt; reste du texte</p></div>');
+
+  // An unclosed head ends at the body; unclosed tags end closed; the result is bounded.
+  assert.equal(quotableHtml('<html><head><title>T</title><meta charset="utf-8"><body><p>a</p>', Parser), '<p>a</p>');
+  assert.equal(quotableHtml('<div><p>a<b>b', Parser), '<div><p>a<b>b</b></p></div>');
+  assert.ok(quotableHtml(`<p>${'x'.repeat(300000)}</p>`, Parser).length <= 100010);
+  assert.equal(quotableHtml('<style>p{}</style><img src="a">  ', Parser), '');
+  // Nested beyond any real message: quoted up to that depth, and closed.
+  const deep = quotableHtml(`<p>début</p>${'<div>'.repeat(1000)}fin`, Parser);
+  assert.match(deep, /^<p>début<\/p><div>/);
+  assert.doesNotMatch(deep, /fin/);
+  assert.equal(deep.split('<div>').length, deep.split('</div>').length);
+});
+
 test('remote HTML and draft views stay linear on hostile input', async () => {
   // Quadratic, each of these would take tens of seconds.
   for (const input of ['<a '.repeat(200000), `<li ${'x'.repeat(400000)}`, `${'<br '.repeat(100000)}>`]) {
     const start = performance.now();
     htmlToPlainText(input);
     assert.ok(performance.now() - start < 1000, `${input.slice(0, 6)}…`);
+  }
+  const { Parser } = await import('htmlparser2');
+  for (const input of ['<a '.repeat(200000), '<div><span>'.repeat(100000), '<b>'.repeat(300000), `<p style="${'color:red;'.repeat(100000)}">`]) {
+    const start = performance.now();
+    quotableHtml(input, Parser);
+    assert.ok(performance.now() - start < 1000, `quote ${input.slice(0, 6)}…`);
   }
   const { client, imap } = draftSetup();
   const nodemailer = await import('nodemailer');
@@ -958,7 +1013,7 @@ test('mailProbe checks every account read-only and reports a fixed detail', asyn
   assert.throws(() => mailProbe({ host: () => 'mail.example.test' }), /configuration\(values\)/);
 });
 
-test('importing the entry points never loads imapflow, nodemailer or mailparser', (t) => {
+test('importing the entry points never loads imapflow, nodemailer, mailparser or htmlparser2', (t) => {
   const script = `
     import { registerHooks } from 'node:module';
     const loaded = [];
@@ -966,7 +1021,7 @@ test('importing the entry points never loads imapflow, nodemailer or mailparser'
     await import('./src/index.js');
     await import('./src/mail.js');
     await import('./src/secrets/index.js');
-    process.stdout.write(JSON.stringify(loaded.filter((name) => /^(imapflow|nodemailer|mailparser)$/.test(name))));
+    process.stdout.write(JSON.stringify(loaded.filter((name) => /^(imapflow|nodemailer|mailparser|htmlparser2)$/.test(name))));
   `;
   if (!('registerHooks' in (process.getBuiltinModule?.('node:module') || {}))) {
     t.skip('module.registerHooks is not available on this Node version');
