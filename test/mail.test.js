@@ -34,6 +34,13 @@ function account(overrides = {}) {
 
 const configuration = (overrides) => stringifyAccountConfig([account(overrides)]);
 
+test('HTML-only messages with an empty plain part still expose their visible text', async () => {
+  const { client } = setup({ parsed: { text: '', html: '<p>Hello Alice,</p><p>See you tomorrow.</p>' } });
+  const message = await client.message('', 'INBOX', 8);
+  assert.match(message.text, /Hello Alice/);
+  assert.match(message.text, /See you tomorrow/);
+});
+
 test('header indexing reads every matching UID without changing flags and refuses partial results', async () => {
   const { client, imap } = setup();
   const result = await client.messageIndex('', { query: { since: new Date('2026-01-01') } });

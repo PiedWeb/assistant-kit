@@ -1004,7 +1004,7 @@ export class MailClient {
       replyTo: parsedAddresses(parsed.replyTo),
       inReplyTo: String(parsed.inReplyTo || ''),
       references: referenceList(parsed.references),
-      text: String(parsed.text || '').slice(0, MAX_BODY_CHARACTERS),
+      text: (String(parsed.text || '').trim() ? String(parsed.text) : htmlToPlainText(parsed.html || '')).slice(0, MAX_BODY_CHARACTERS),
       html: typeof parsed.html === 'string' ? parsed.html.slice(0, MAX_BODY_CHARACTERS) : '',
       attachments: (parsed.attachments || []).map((attachment, index) => ({
         id: String(index),
