@@ -34,6 +34,30 @@ function account(overrides = {}) {
 
 const configuration = (overrides) => stringifyAccountConfig([account(overrides)]);
 
+test('header indexing reads every matching UID without changing flags and refuses partial results', async () => {
+  const { client, imap } = setup();
+  const result = await client.messageIndex('', { query: { since: new Date('2026-01-01') } });
+  assert.equal(result.complete, true);
+  assert.equal(result.total, 2);
+  assert.deepEqual(result.messages.map(item => item.uid), [8, 9]);
+  assert.ok(imap.locks.every(lock => lock.readOnly));
+  assert.equal(imap.flagWrites, 0);
+  const bounded = await client.messageIndex('', { limit: 1 });
+  assert.equal(bounded.complete, false);
+  assert.deepEqual(bounded.messages, []);
+});
+
+test('a stable draft Message-ID makes a retry idempotent and rejects header injection', async () => {
+  const { client, imap, smtp } = setup({ allowWrites: true });
+  const input = { to: ['alice@example.com'], subject: 'Reply', text: 'Hello', messageId: '<job-123@example.com>' };
+  const first = await client.saveDraft('', input);
+  const second = await client.saveDraft('', input);
+  assert.equal(first.uid, second.uid);
+  assert.equal(imap.appended.length, 1);
+  assert.equal(smtp.created, 0);
+  await assert.rejects(client.saveDraft('', { ...input, messageId: '<bad@example.com>\r\nBcc: hidden@example.com' }), /Message-ID invalide/);
+});
+
 const ORIGINAL = Object.freeze({
   uid: 8,
   size: 1200,

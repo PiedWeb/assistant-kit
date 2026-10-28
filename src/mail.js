@@ -938,6 +938,40 @@ export class MailClient {
     });
   }
 
+  /** Complete, bounded header index for scheduled triage; EXAMINE never marks mail as read. */
+  async messageIndex(id = '', { mailbox = 'INBOX', query = { all: true }, limit = 5000 } = {}) {
+    const folder = requiredText(mailbox, 'Le dossier IMAP', 255);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 10000) throw new MailError('Limite IMAP invalide.');
+    const account = await this.#resolve(id);
+    return this.#withImap(account, async (client) => {
+      const lock = await client.getMailboxLock(folder, { readOnly: true, acquireTimeout: this.timeout });
+      try {
+        const uids = (await client.search(query, { uid: true })) || [];
+        const result = { account: account.id, mailbox: folder, uidValidity: String(client.mailbox.uidValidity || ''),
+          total: uids.length, complete: uids.length <= limit, messages: [] };
+        if (!result.complete || !uids.length) return result;
+        for await (const entry of client.fetch(uids, {
+          uid: true, envelope: true, flags: true, internalDate: true, size: true,
+          headers: ['References', 'In-Reply-To', 'Reply-To', 'Auto-Submitted', 'List-Id', 'Precedence'],
+        }, { uid: true })) {
+          const parsed = entry.headers ? await this.#parser(entry.headers) : {};
+          result.messages.push({ ...envelopeView(entry), mailbox: folder,
+            internalDate: entry.internalDate ? new Date(entry.internalDate).toISOString() : '',
+            replyTo: parsedAddresses(parsed.replyTo),
+            inReplyTo: String(parsed.inReplyTo || entry.envelope?.inReplyTo || ''),
+            references: referenceList(parsed.references),
+            autoSubmitted: String(parsed.headers?.get('auto-submitted') || ''),
+            listId: String(parsed.headers?.get('list-id') || ''),
+            precedence: String(parsed.headers?.get('precedence') || ''),
+            draft: Boolean(entry.flags?.has?.('\\Draft')),
+          });
+        }
+        result.messages.sort((a, b) => a.uid - b.uid);
+        return result;
+      } finally { lock.release(); }
+    });
+  }
+
   /** Raw imapflow metadata and the mailparser result, read with EXAMINE. */
   async parsedMessage(id, mailbox, uid) {
     const folder = requiredText(mailbox, 'Le dossier IMAP', 255);
@@ -968,6 +1002,8 @@ export class MailClient {
       to: parsedAddresses(parsed.to),
       cc: parsedAddresses(parsed.cc),
       replyTo: parsedAddresses(parsed.replyTo),
+      inReplyTo: String(parsed.inReplyTo || ''),
+      references: referenceList(parsed.references),
       text: String(parsed.text || '').slice(0, MAX_BODY_CHARACTERS),
       html: typeof parsed.html === 'string' ? parsed.html.slice(0, MAX_BODY_CHARACTERS) : '',
       attachments: (parsed.attachments || []).map((attachment, index) => ({
@@ -1369,7 +1405,7 @@ export class MailClient {
    */
   #compose(account, {
     to = [], cc = [], bcc = [], subject, text = '', html = '', attachments = [],
-    inReplyTo = '', references = [], quote = null,
+    inReplyTo = '', references = [], quote = null, messageId = '',
   } = {}, { draft = false, bodies = null, kept = [] } = {}) {
     const target = recipients(to, 'Destinataire');
     // A draft is finished in the mail client: recipients may come later.
@@ -1383,6 +1419,9 @@ export class MailClient {
     }
     if (!Array.isArray(references)) throw new MailError('Les références doivent former une liste.');
     const composed = bodies || composeBodies(account, { text, html, quote }, this.#mark);
+    if (messageId && !/^<[a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+>$/.test(messageId)) {
+      throw new MailError('Message-ID invalide.');
+    }
     return {
       from: { name: account.label, address: account.address },
       to: target,
@@ -1393,7 +1432,7 @@ export class MailClient {
       ...(composed.html ? { html: composed.html } : {}),
       attachments: [...kept, ...(bodies ? [] : quote?.images || []), ...attachments],
       date: new Date(),
-      messageId: generatedMessageId(account),
+      messageId: messageId || generatedMessageId(account),
       ...(this.#mark?.header ? { headers: { [this.#mark.header.name]: this.#mark.header.value } } : {}),
       ...(inReplyTo ? { inReplyTo: String(inReplyTo).slice(0, 1000) } : {}),
       ...(references.length ? { references: references.map(String).slice(0, 100) } : {}),
