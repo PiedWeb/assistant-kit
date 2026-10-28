@@ -29,6 +29,8 @@ const MAX_ATTACHMENTS = 10;
 const MAX_BODY_CHARACTERS = 100000;
 const MAX_COLLAPSED_TEXT = 200000;
 const MASK = '«valeur masquée»';
+// Preserve every byte except transport line endings, including headers and attachments.
+const messageFingerprint = raw => createHash('sha256').update(raw.toString('binary').replace(/\r\n/g, '\n'), 'binary').digest('hex');
 // imapflow infers specialUse from folder names too; the patterns only catch the
 // servers it misses. `flags` are set on the copy appended there: a draft is
 // left unread, so that what an agent wrote stands out until someone reads it.
@@ -1105,6 +1107,67 @@ export class MailClient {
     return this.#saveDraft(id, await this.#replyInput(id, mailbox, uid, input, { draft: true }), 'reply-draft');
   }
 
+  /** Move an unchanged, recorded draft into a recoverable folder; never use COPY/EXPUNGE fallback. */
+  async archiveDraft(id = '', { messageId, fingerprint, destination, dryRun = false } = {}) {
+    if (!dryRun) this.#assertWrites('imap');
+    if (!/^<[^<>\s]+@[^<>\s]+>$/.test(messageId || '') || !/^[a-f0-9]{64}$/.test(fingerprint || '')) {
+      throw new MailError('Message-ID et empreinte complète du brouillon requis.');
+    }
+    const target = requiredText(destination, 'Le dossier de récupération', 255);
+    if (/[\x00-\x1f\x7f]/.test(target)) throw new MailError('Dossier de récupération invalide.');
+    const account = await this.#resolve(id);
+    try {
+      const result = await this.#withImap(account, async client => {
+        const drafts = await this.#findFolder(client, DRAFTS_FOLDER);
+        const folders = await client.list({ listOnly: true });
+        const existing = folders.find(folder => folder.path === target);
+        if (!drafts || target === drafts || target.toUpperCase() === 'INBOX' || existing?.specialUse) {
+          throw new MailError('Le dossier de récupération doit être distinct des dossiers spéciaux.');
+        }
+        const find = async () => {
+          const uids = (await client.search({ header: { 'message-id': messageId } }, { uid: true })) || [];
+          if (uids.length > 1) throw new MailError('Brouillon ambigu : plusieurs messages correspondent.');
+          if (!uids.length) return null;
+          const current = await this.#fetchParsed(client, uids[0]);
+          if (current.parsed.messageId !== messageId || current.fingerprint !== fingerprint
+              || !current.metadata.flags?.has?.('\\Draft') || current.metadata.flags.has('\\Deleted')) {
+            throw new MailError('Brouillon modifié ou identité non confirmée : conservé.', { code: 'DRAFT_CHANGED' });
+          }
+          return uids[0];
+        };
+        const inFolder = async (folder, run) => {
+          const lock = await client.getMailboxLock(folder, { readOnly: dryRun, acquireTimeout: this.timeout });
+          try { return await run(); } finally { lock.release(); }
+        };
+        const archived = existing ? await inFolder(target, find) : null;
+        let moved = false;
+        const source = await inFolder(drafts, async () => {
+          const uid = await find();
+          if (!uid) return null;
+          if (archived) throw new MailError('Brouillon présent dans les deux dossiers : conservé.');
+          if (dryRun) return uid;
+          if (!client.capabilities?.has?.('MOVE')) throw new MailError('Le serveur doit prendre en charge UID MOVE pour archiver sans suppression globale.');
+          if (!existing) await client.mailboxCreate(target);
+          const result = await client.messageMove(uid, target, { uid: true });
+          if (!result) throw new MailError('Déplacement du brouillon non confirmé.');
+          moved = true;
+          if (await find()) throw new MailError('Le brouillon est encore présent après déplacement.');
+          return uid;
+        });
+        if (moved) {
+          if (!await inFolder(target, find)) throw new MailError('Archive du brouillon introuvable après déplacement.');
+          return { status: 'archived', mailbox: target, recovered: false };
+        }
+        return { status: archived ? 'archived' : source ? 'eligible' : 'absent', mailbox: target, recovered: Boolean(archived) };
+      });
+      if (!dryRun) await this.#record(account, 'draft-archive', null, result.status);
+      return result;
+    } catch (error) {
+      if (!dryRun) await this.#record(account, 'draft-archive', null, 'failed');
+      throw error;
+    }
+  }
+
   /**
    * Rewrite the draft `uid` of `mailbox` (the Drafts folder when empty). IMAP
    * cannot edit a stored message: the new version is appended to the same
@@ -1285,7 +1348,7 @@ export class MailClient {
     if (raw.source.length > this.maxMessageBytes) {
       throw new MailError(`Message trop volumineux (limite ${this.maxMessageBytes} octets).`);
     }
-    return { metadata, parsed: await this.#parser(raw.source, { keepCidLinks: true }) };
+    return { metadata, parsed: await this.#parser(raw.source, { keepCidLinks: true }), fingerprint: messageFingerprint(raw.source) };
   }
 
   /** Append `raw` to the `target` folder unless its Message-ID is already there. */
@@ -1507,6 +1570,8 @@ export class MailClient {
       messageId: message.messageId,
       mailbox: saved.mailbox,
       uid: Number(saved.uid || 0),
+      // A retry can recover a draft edited since the original deposit: never adopt it as the baseline.
+      fingerprint: saved.added ? messageFingerprint(raw) : null,
       version: this.#draftView(account, composedAsParsed(message)).version,
       to: message.to,
       sent: false,

@@ -131,6 +131,8 @@ const mail = new MailClient({ configuration: smtpImapAccountsJson, allowedDomain
 await mail.messages('', { unreadOnly: true, query: 'devis' }); // lecture seule (EXAMINE)
 const writer = new MailClient({ configuration, allowWrites: true, mark, audit });
 const draft = await writer.saveDraft('', { to: ['client@example.org'], subject: 'Devis', text });
+// Après confirmation par l'application que ce brouillon est obsolète :
+await writer.archiveDraft('', { messageId: draft.messageId, fingerprint: draft.fingerprint, destination: 'Assistant-obsolete', dryRun: true });
 await writer.updateDraft('', '', draft.uid, { version: draft.version, text: 'Version corrigée', cc: ['copie@example.org'] });
 await writer.replyDraft('', 'INBOX', 8, { text: 'Merci, je regarde.' }); // à l'auteur du message 8
 await writer.setSeen('', 'INBOX', 8, false);                    // remettre un message en non lu
@@ -144,6 +146,17 @@ sans doublon. Un brouillon est enregistré non lu (`\Draft` sans `\Seen`) : il
 ressort dans la boîte jusqu'à ce que quelqu'un le relise. `authorize` (contrôle
 d'identité), `audit` (journal sans contenu) et `mark` (marque et en-tête des
 messages écrits par un agent) se branchent par options.
+
+`saveDraft` et `replyDraft` rendent aussi `fingerprint`, l'empreinte SHA-256 du
+message MIME complet, avec normalisation des fins de ligne. La conserver lors
+du dépôt. Elle vaut `null` si le Message-ID existait déjà : un ancien brouillon
+peut avoir été retouché et ne doit pas devenir une nouvelle référence.
+`archiveDraft` vérifie cette empreinte et l'identité exacte avant un UID MOVE
+vers un dossier de récupération distinct des dossiers spéciaux. Il refuse les
+doublons, les modifications et les serveurs sans MOVE ; il ne fait jamais de
+COPY suivi d'un EXPUNGE global. `dryRun: true` reste en lecture seule. La preuve
+qu'une réponse a été envoyée relève de l'application appelante. Un brouillon
+ancien sans empreinte doit être conservé.
 
 Une réponse (`reply`, `replyDraft`) reste dans le fil du message cité : objet
 en « Re: », `In-Reply-To`, `References` et historique sous la signature.

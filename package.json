@@ -1,6 +1,6 @@
 {
   "name": "@piedweb/assistant-kit",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "description": "Connecteurs partagés des assistants Pied Web : CLI d’atelier, API Pushword et Cockpit, trousseau au format du tronc commun Grand Angle, Cadrank, IMAP/SMTP.",
   "license": "MIT",
   "author": "Robin@PiedWeb <contact@piedweb.com> (https://piedweb.com)",

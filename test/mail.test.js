@@ -387,9 +387,11 @@ test('a draft is appended once to Drafts with \\Draft, never through SMTP', asyn
   const draft = await client.saveDraft('', { bcc: ['Cache@Example.org'], subject: 'Objet', text: 'Corps' });
   assert.equal(smtp.created, 0);
   assert.deepEqual(draft, {
-    account: 'perso', messageId: draft.messageId, mailbox: 'INBOX.Drafts', uid: 100, version: draft.version, to: [], sent: false,
+    account: 'perso', messageId: draft.messageId, mailbox: 'INBOX.Drafts', uid: 100, version: draft.version,
+    fingerprint: draft.fingerprint, to: [], sent: false,
   });
   assert.match(draft.version, /^[0-9a-f]{16}$/);
+  assert.match(draft.fingerprint, /^[0-9a-f]{64}$/);
   assert.match(draft.messageId, /^<[0-9a-f-]+@example\.com>$/);
   const [stored] = imap.appended;
   assert.equal(stored.mailbox, 'INBOX.Drafts');
