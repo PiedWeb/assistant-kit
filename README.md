@@ -82,7 +82,7 @@ projet en a une (`snapshotKey`), sinon avec le jeton ; `snapshotTimeoutMs` borne
 son téléchargement (2 minutes). `onPulled({ host, directory })` ajoute une étape
 propre au projet après chaque pull.
 
-Chaque résultat de `sync()` porte `status` (`synced`, `conflict`, `auth`,
+Chaque résultat de `sync()` porte `status` (`synced`, `conflict`, `collaborative`, `auth`,
 `no-revision`, `outside-hosts`, `error`), `message`, et pour un refus HTTP
 `httpStatus` et `responseText` : un projet peut écrire ses propres messages.
 Les erreurs se reconnaissent à leur `code`, jamais à leur texte :
@@ -91,8 +91,14 @@ aucune tentative n'a eu de réponse, `CROSS_ORIGIN_REDIRECT`.
 
 ### Éditer avec quelqu’un dans l’admin
 
-Si la page est ouverte en **Mode collaboratif**, utilise son identifiant
-numérique, visible dans l’URL de l’éditeur.
+Avant de modifier une page issue d’un snapshot, consulte son état en direct.
+
+```sh
+node bin/assistant.js pushword status example.com guides/sortie
+```
+
+Si la réponse contient `"collaborative": true`, utilise l’identifiant `id`
+renvoyé pour rejoindre la session.
 
 ```sh
 node bin/assistant.js pushword collaborate 42 "ancien passage" "nouveau passage"
@@ -103,9 +109,10 @@ nouveau passage vide (`""`) supprime le texte. Place `--` avant les deux passage
 si l’un commence par `--`.
 
 Cette commande utilise `POST /api/pages/{id}/draft` avec le jeton éditeur. Il
-faut une instance Pushword qui expose cette route et a activé le mode
-collaboratif. Le miroir local reste tel quel. Une écriture dans `content/` peut
-déclencher le hook de sauvegarde classique et fermer la session partagée.
+faut une instance Pushword qui expose cette route. Avec une instance qui
+fournit l’état collaboratif, le hook protège la
+session en cours et conserve le fichier local si Pushword refuse la
+sauvegarde classique.
 En cas de délai dépassé pendant l’enregistrement, relis la page avant de
 relancer la commande.
 

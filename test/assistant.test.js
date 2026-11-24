@@ -136,6 +136,20 @@ test('the collaborative command passes literal text directly to the Pushword cli
   assert.deepEqual(calls, [['42', '--Texte', '']]);
 });
 
+test('the status command returns live editing status for a page in the snapshot', async () => {
+  const result = await run(['pushword', 'status', 'example.com', 'guides/weekend'], {
+    createWorkspace: () => ({
+      client: { editingStatus: async (host, slug) => {
+        assert.equal(host, 'example.com');
+        assert.equal(slug, 'guides/weekend');
+        return { id: 42, collaborative: false };
+      } },
+    }),
+  });
+  assert.equal(result.stderr, '');
+  assert.deepEqual(JSON.parse(result.stdout), { id: 42, collaborative: false });
+});
+
 test('projects add actions and scopes, and replace a built-in action', async () => {
   const seen = [];
   const result = await run(['pushword', 'context-pull', 'example.com'], {

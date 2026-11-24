@@ -212,6 +212,11 @@ export class ContentWorkspace {
         message: `${label} : conflit, le fichier a été remplacé par la version du serveur `
           + `(rev ${short(extractRevision(response.text))}). Réappliquer la modification sur ce nouveau texte.` });
     }
+    if (response.status === 423) {
+      return this.report({ ...base, status: 'collaborative', httpStatus: 423,
+        message: `${label} : session collaborative active. Les retouches restent dans le fichier local. `
+          + `Consulter \`pushword status ${page.host} ${page.slug}\` puis utiliser \`pushword collaborate\` pour le Markdown.` });
+    }
     if (response.status === 401 || response.status === 403) {
       return this.report({ ...base, status: 'auth', httpStatus: response.status,
         message: `Authentification refusée par Pushword (HTTP ${response.status}) : vérifier le jeton.` });

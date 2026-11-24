@@ -113,6 +113,7 @@ function helpText(settings) {
     '  pushword whoami | docs',
     '  pushword pull [hôte ...]             remplace content/{hôte}/ par la production',
     '  pushword sync <content/{hôte}/{slug}.md ...> [--no-publish]',
+    '  pushword status <hôte> <slug>        état collaboratif en direct',
     `  ${COLLABORATE_USAGE}`,
     '  pushword sync-all [--no-publish]     pages modifiées depuis le dernier pull',
     '  pushword sync-hook                   hook PostToolUse (Claude Code, Codex)',
@@ -239,6 +240,10 @@ async function pushwordCommand(context) {
 
   if (action === 'whoami') return out(await client.whoami());
   if (action === 'docs') return out(await client.docs());
+  if (action === 'status') {
+    usage(2, 'pushword status <hôte> <slug>');
+    return out(await client.editingStatus(args[0], args[1]));
+  }
   if (action === 'collaborate') {
     if (args.length !== 3) throw new Error(`Usage : ${settings.cli} ${COLLABORATE_USAGE}`);
     const [pageId, search, replacement] = args;

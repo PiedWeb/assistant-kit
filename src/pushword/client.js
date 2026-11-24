@@ -88,6 +88,15 @@ export class PushwordClient {
     return (await this.http.request('GET', pagePath('/api/page', host, slug))).payload;
   }
 
+  async editingStatus(host, slug) {
+    const url = `${pagePath('/api/page', host, slug)}?return=editing`;
+    const { payload } = await this.http.request('GET', url);
+    if (!Number.isInteger(payload?.id) || typeof payload.collaborative !== 'boolean') {
+      throw new Error('Cette instance Pushword ne fournit pas l’état collaboratif.');
+    }
+    return { id: payload.id, collaborative: payload.collaborative };
+  }
+
   /** Replace a unique passage of Markdown in the session shared with the admin editor. */
   async collaborate(pageId, search, replacement) {
     if (!/^[1-9][0-9]*$/.test(pageId) || typeof search !== 'string' || search === ''
@@ -172,7 +181,7 @@ export class PushwordClient {
     const response = await this.http.send('PUT', pagePath('/api/content/page', host, slug), {
       body: text,
       accept: 'text/markdown',
-      headers: { 'Content-Type': MARKDOWN, 'If-Match': revision },
+      headers: { 'Content-Type': MARKDOWN, 'If-Match': revision, 'X-Pushword-Respect-Collaboration': '1' },
     });
     return { status: response.status, text: await response.text() };
   }

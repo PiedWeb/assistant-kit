@@ -64,6 +64,41 @@ function page(revision, body = 'Body') {
   return `---\nh1: Title\nrevision: ${revision} # read only\n---\n\n${body}\n`;
 }
 
+test('the editing status is read live and missing support is reported separately', async (t) => {
+  const results = [{ id: 42, collaborative: true }, { id: 42, collaborative: false }, { revision: 'r1' }];
+  const { workspace, server } = workspaceFor(t, {
+    'GET /api/page/example.com/guides/weekend': ({ search }) => {
+      assert.equal(search, '?return=editing');
+      return Response.json(results.shift());
+    },
+  });
+  assert.deepEqual(await workspace.client.editingStatus(HOST, 'guides/weekend'), { id: 42, collaborative: true });
+  assert.deepEqual(await workspace.client.editingStatus(HOST, 'guides/weekend'), { id: 42, collaborative: false });
+  await assert.rejects(workspace.client.editingStatus(HOST, 'guides/weekend'), /ne fournit pas l’état collaboratif/);
+  assert.equal(server.requests.length, 3);
+  assert.ok(server.requests.every(({ headers }) => headers.get('Authorization') === 'Bearer api-token'));
+});
+
+test('a page that becomes collaborative after a status read keeps its local edit', async (t) => {
+  const { root, workspace, server, logs } = workspaceFor(t, {
+    'GET /api/page/example.com/page': () => Response.json({ id: 42, collaborative: false }),
+    'PUT /api/content/page/example.com/page': ({ headers }) => {
+      assert.equal(headers.get('X-Pushword-Respect-Collaboration'), '1');
+      return Response.json({ error: 'collaboration_active', id: 42 }, { status: 423 });
+    },
+  });
+  const file = path.join(root, 'content', HOST, 'page.md');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const local = page('r1', 'Local edit');
+  fs.writeFileSync(file, local);
+
+  assert.equal((await workspace.client.editingStatus(HOST, 'page')).collaborative, false);
+  assert.equal(await runSyncHook(workspace, { tool_name: 'Edit', tool_input: { file_path: file } }), 2);
+  assert.equal(fs.readFileSync(file, 'utf8'), local);
+  assert.match(logs.join('\n'), /session collaborative active.*pushword collaborate/);
+  assert.deepEqual(server.requests.map(({ method }) => method), ['GET', 'PUT']);
+});
+
 test('collaborative writes merge a concurrent browser edit before submitting the new cursor', async (t) => {
   const browser = new Y.Doc();
   t.after(() => browser.destroy());
