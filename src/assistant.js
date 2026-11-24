@@ -9,6 +9,7 @@ import { probeConnector } from './secrets/probes.js';
 import { configureVault } from './secrets/server.js';
 
 const MAIL_WRITES = Object.freeze(['draft', 'draft-reply', 'draft-update', 'mark-read', 'send', 'reply']);
+const COLLABORATE_USAGE = 'pushword collaborate <id-page> <texte à remplacer> <nouveau texte>';
 
 /**
  * The `bin/assistant.js` of a content workspace: doctor, vault, pushword,
@@ -112,6 +113,7 @@ function helpText(settings) {
     '  pushword whoami | docs',
     '  pushword pull [hôte ...]             remplace content/{hôte}/ par la production',
     '  pushword sync <content/{hôte}/{slug}.md ...> [--no-publish]',
+    `  ${COLLABORATE_USAGE}`,
     '  pushword sync-all [--no-publish]     pages modifiées depuis le dernier pull',
     '  pushword sync-hook                   hook PostToolUse (Claude Code, Codex)',
     '  pushword create <content/{hôte}/{slug}.md> [--no-publish]',
@@ -237,6 +239,11 @@ async function pushwordCommand(context) {
 
   if (action === 'whoami') return out(await client.whoami());
   if (action === 'docs') return out(await client.docs());
+  if (action === 'collaborate') {
+    if (args.length !== 3) throw new Error(`Usage : ${settings.cli} ${COLLABORATE_USAGE}`);
+    const [pageId, search, replacement] = args;
+    return out({ revision: await client.collaborate(pageId, search, replacement) });
+  }
   if (action === 'pull') {
     for (const destination of await workspace.pull(args.length ? args : settings.hosts)) {
       stdout.write(`✓ ${path.basename(destination)} → ${path.relative(settings.root || process.cwd(), destination)}\n`);

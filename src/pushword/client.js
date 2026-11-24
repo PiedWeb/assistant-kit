@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
+import { simpleDiffString } from 'lib0/diff';
+import * as Y from 'yjs';
 import { HttpClient, HttpError, parseResponse } from '../http.js';
 import { encodeSlug, validateHost } from './content.js';
 
@@ -84,6 +86,66 @@ export class PushwordClient {
 
   async getPage(host, slug) {
     return (await this.http.request('GET', pagePath('/api/page', host, slug))).payload;
+  }
+
+  /** Replace a unique passage of Markdown in the session shared with the admin editor. */
+  async collaborate(pageId, search, replacement) {
+    if (!/^[1-9][0-9]*$/.test(pageId) || typeof search !== 'string' || search === ''
+      || typeof replacement !== 'string' || search === replacement) {
+      throw new Error('Indiquer l’identifiant de la page et deux textes différents, dont un texte à remplacer non vide.');
+    }
+
+    const url = `/api/pages/${pageId}/draft`;
+    const sync = (body) => this.http.request('POST', url, { body, redirect: 'manual' });
+    const { payload: joined } = await sync({ after: 0 });
+    const draft = new Y.Doc();
+    const applySnapshot = (snapshot) => Y.applyUpdate(draft, Buffer.from(snapshot, 'base64'));
+
+    try {
+      const body = draft.getText('body');
+      if (joined.snapshot) {
+        applySnapshot(joined.snapshot);
+      } else {
+        const seed = new Y.Doc();
+        // Pushword uses client ID 1 to give every participant the same baseline.
+        seed.clientID = 1;
+        seed.getText('body').insert(0, joined.baseline);
+        Y.applyUpdate(draft, Y.encodeStateAsUpdate(seed));
+        seed.destroy();
+      }
+      for (const update of joined.legacyUpdates ?? []) {
+        applySnapshot(update);
+      }
+
+      const current = body.toString();
+      const offset = current.indexOf(search);
+      if (offset < 0 || offset !== current.lastIndexOf(search)) {
+        throw new Error('Le texte à remplacer doit apparaître exactement une fois dans le brouillon partagé.');
+      }
+      const { index, remove, insert } = simpleDiffString(search, replacement);
+      draft.transact(() => {
+        if (remove) body.delete(offset + index, remove);
+        if (insert) body.insert(offset + index, insert);
+      });
+
+      let after = joined.after;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const { payload } = await sync({
+          room: joined.room,
+          after,
+          snapshot: Buffer.from(Y.encodeStateAsUpdate(draft)).toString('base64'),
+          content: body.toString(),
+        });
+        if (payload.accepted === true) return payload.revision;
+        if (payload.accepted !== false || !payload.snapshot || !(payload.after > after)) break;
+
+        applySnapshot(payload.snapshot);
+        after = payload.after;
+      }
+      throw new Error('Le brouillon partagé a changé pendant l’enregistrement. Relire le texte avant de réessayer.');
+    } finally {
+      draft.destroy();
+    }
   }
 
   /** Delete a page; the server requires a target and keeps the slug as a redirection. */

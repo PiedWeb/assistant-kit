@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import * as tar from 'tar';
+import * as Y from 'yjs';
 import {
   ContentWorkspace,
   PushwordClient,
@@ -62,6 +63,76 @@ function workspaceFor(t, routes, options = {}) {
 function page(revision, body = 'Body') {
   return `---\nh1: Title\nrevision: ${revision} # read only\n---\n\n${body}\n`;
 }
+
+test('collaborative writes merge a concurrent browser edit before submitting the new cursor', async (t) => {
+  const browser = new Y.Doc();
+  t.after(() => browser.destroy());
+  browser.clientID = 1;
+  const baseline = '🥾 Départ samedi.\n\nRetour.';
+  const body = browser.getText('body');
+  body.insert(0, baseline);
+  browser.clientID = 2;
+  const day = baseline.indexOf('samedi');
+  body.delete(day, 'samedi'.length);
+  body.insert(day, 'dimanche');
+  const snapshot = Buffer.from(Y.encodeStateAsUpdate(browser)).toString('base64');
+
+  const { workspace, server } = workspaceFor(t, {
+    'POST /api/pages/42/draft': ({ body: raw }) => {
+      const request = JSON.parse(raw);
+      if (!request.room) return Response.json({ room: 'shared', after: 0, baseline, snapshot: null });
+      if (request.after === 0) return Response.json({ after: 1, snapshot, accepted: false });
+      assert.equal(request.after, 1);
+      Y.applyUpdate(browser, Buffer.from(request.snapshot, 'base64'));
+      assert.equal(body.toString(), request.content);
+      return Response.json({ revision: '3', accepted: true });
+    },
+  });
+  assert.equal(await workspace.client.collaborate('42', '🥾 Départ samedi', '🧭 Sortie samedi'), '3');
+  assert.equal(server.requests.length, 3);
+  assert.equal(server.requests[0].headers.get('Authorization'), 'Bearer api-token');
+  assert.deepEqual(JSON.parse(server.requests[0].body), { after: 0 });
+  assert.equal(JSON.parse(server.requests[1].body).content, '🧭 Sortie samedi.\n\nRetour.');
+  assert.equal(body.toString(), '🧭 Sortie dimanche.\n\nRetour.');
+});
+
+test('collaborative writes use the shared snapshot and require an unambiguous passage', async (t) => {
+  const browser = new Y.Doc();
+  t.after(() => browser.destroy());
+  browser.getText('body').insert(0, 'Départ. Retour dimanche. Retour tardif.');
+  const snapshot = Buffer.from(Y.encodeStateAsUpdate(browser)).toString('base64');
+  const { workspace, server } = workspaceFor(t, {
+    'POST /api/pages/42/draft': ({ body }) => {
+      const request = JSON.parse(body);
+      if (!request.room) return Response.json({ room: 'shared', after: 2, baseline: null, snapshot });
+      assert.equal(request.after, 2);
+      assert.equal(request.content, 'Départ. Retour tardif.');
+      return Response.json({ revision: '4', accepted: true });
+    },
+  });
+  const { client } = workspace;
+  await assert.rejects(client.collaborate('42/other', 'Départ', 'Sortie'), /identifiant/);
+  await assert.rejects(client.collaborate('42', 'Départ', null), /identifiant/);
+  assert.equal(server.requests.length, 0);
+  await assert.rejects(client.collaborate('42', 'Absent', 'Nouveau'), /exactement une fois/);
+  await assert.rejects(client.collaborate('42', 'Retour', 'Nouveau'), /exactement une fois/);
+  assert.ok(server.requests.every(({ body }) => JSON.parse(body).room === undefined));
+  assert.equal(await client.collaborate('42', ' Retour dimanche.', ''), '4');
+});
+
+test('collaborative writes never follow a login redirect or replay an uncertain save', async (t) => {
+  for (const status of [302, 409, 503]) {
+    const { workspace, server } = workspaceFor(t, {
+      'POST /api/pages/42/draft': ({ body }) => JSON.parse(body).room
+        ? new Response(null, { status, headers: { Location: '/login' } })
+        : Response.json({ room: 'shared', after: 0, baseline: 'Départ.' }),
+    });
+    await assert.rejects(workspace.client.collaborate('42', 'Départ', 'Sortie'), { status });
+    assert.deepEqual(server.requests.map(({ method, path }) => [method, path]), [
+      ['POST', '/api/pages/42/draft'], ['POST', '/api/pages/42/draft'],
+    ]);
+  }
+});
 
 test('pull installs editorial files only, marks the pull and refuses to wipe unsynced edits', async (t) => {
   const archive = await snapshotArchive(t, {

@@ -89,6 +89,26 @@ Les erreurs se reconnaissent à leur `code`, jamais à leur texte :
 `UNSYNCED_CHANGES` et `EMPTY_SNAPSHOT` pour un pull, `NETWORK_ERROR` quand
 aucune tentative n'a eu de réponse, `CROSS_ORIGIN_REDIRECT`.
 
+### Éditer avec quelqu’un dans l’admin
+
+Si la page est ouverte en **Mode collaboratif**, utilise son identifiant
+numérique, visible dans l’URL de l’éditeur.
+
+```sh
+node bin/assistant.js pushword collaborate 42 "ancien passage" "nouveau passage"
+```
+
+Le passage à remplacer doit être unique dans le corps Markdown courant. Un
+nouveau passage vide (`""`) supprime le texte. Place `--` avant les deux passages
+si l’un commence par `--`.
+
+Cette commande utilise `POST /api/pages/{id}/draft` avec le jeton éditeur. Il
+faut une instance Pushword qui expose cette route et a activé le mode
+collaboratif. Le miroir local reste tel quel. Une écriture dans `content/` peut
+déclencher le hook de sauvegarde classique et fermer la session partagée.
+En cas de délai dépassé pendant l’enregistrement, relis la page avant de
+relancer la commande.
+
 ## Secrets
 
 ```js

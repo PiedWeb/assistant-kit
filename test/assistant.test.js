@@ -123,6 +123,19 @@ test('a file named on the command line syncs whatever its host, sync-all keeps t
   assert.match(all.stdout, /Aucune page modifiée/);
 });
 
+test('the collaborative command passes literal text directly to the Pushword client', async () => {
+  const calls = [];
+  const createWorkspace = () => ({
+    client: { collaborate: async (...args) => { calls.push(args); return '2'; } },
+  });
+  const result = await run(['pushword', 'collaborate', '42', '--', '--Texte', ''], { createWorkspace });
+  assert.equal(result.stderr, '');
+  assert.deepEqual(JSON.parse(result.stdout), { revision: '2' });
+  const bad = await run(['pushword', 'collaborate', '42', 'incomplet'], { createWorkspace });
+  assert.match(bad.stderr, /Usage.*pushword collaborate/);
+  assert.deepEqual(calls, [['42', '--Texte', '']]);
+});
+
 test('projects add actions and scopes, and replace a built-in action', async () => {
   const seen = [];
   const result = await run(['pushword', 'context-pull', 'example.com'], {
